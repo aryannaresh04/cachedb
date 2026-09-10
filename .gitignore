@@ -1,0 +1,10 @@
+build*/
+*.o
+data/
+bench/
+*.sst
+wal.log
+compile_commands.json
+.cache/
+.DS_Store
+PROJECT.md
