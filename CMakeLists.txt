@@ -35,6 +35,7 @@ target_include_directories(doctest SYSTEM INTERFACE
 # component as M1-M4 land.
 add_library(cachedb_core
   src/command.cpp
+  src/connection.cpp
   src/resp.cpp
   src/store.cpp
 )

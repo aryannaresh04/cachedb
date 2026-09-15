@@ -7,5 +7,6 @@ function(cachedb_add_test name)
 endfunction()
 
 cachedb_add_test(test_command)
+cachedb_add_test(test_connection)
 cachedb_add_test(test_resp)
 cachedb_add_test(test_store)
