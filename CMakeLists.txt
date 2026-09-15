@@ -41,5 +41,16 @@ add_library(cachedb_core
 )
 target_include_directories(cachedb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# epoll is Linux-only. On any other host the library and tests still build --
+# which is the point, since most of the engine has nothing to do with sockets
+# -- and only the server itself is skipped.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_sources(cachedb_core PRIVATE src/server.cpp)
+  add_executable(cachedb src/main.cpp)
+  target_link_libraries(cachedb PRIVATE cachedb_core)
+else()
+  message(STATUS "Not Linux: skipping the server (epoll). Tests still build.")
+endif()
+
 enable_testing()
 add_subdirectory(tests)
