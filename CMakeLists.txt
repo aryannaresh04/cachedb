@@ -38,6 +38,7 @@ add_library(cachedb_core
   src/connection.cpp
   src/resp.cpp
   src/store.cpp
+  src/wal.cpp
 )
 target_include_directories(cachedb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
