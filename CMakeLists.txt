@@ -35,6 +35,7 @@ target_include_directories(doctest SYSTEM INTERFACE
 # component as M1-M4 land.
 add_library(cachedb_core
   src/resp.cpp
+  src/store.cpp
 )
 target_include_directories(cachedb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
