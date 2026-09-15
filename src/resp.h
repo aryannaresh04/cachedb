@@ -102,4 +102,44 @@ namespace cachedb
     size_t bulk_remaining_ = 0;      // payload bytes still to read
   };
 
+
+  // --------------------------------------------------------------------
+  // Reply serialization
+  //
+  // Every function appends to `out` instead of returning a string. The
+  // destination is always the connection's write buffer, and when one read()
+  // delivers several commands their replies must land there back to back --
+  // appending does that without an intermediate allocation per reply.
+  //
+  // Note this is the opposite choice from Command, which owns its bytes. The
+  // lifetimes differ: nothing here is retained past the call, so there is no
+  // buffer that can move out from under us.
+  // --------------------------------------------------------------------
+
+  // Line-terminated replies: framing is "read to the next CRLF", so a CR or LF
+  // inside the payload would forge a reply boundary. Use these only for
+  // strings we control -- literals and status codes. Anything a client gave us
+  // goes through append_bulk_string, which is length-prefixed and therefore
+  // cannot be escaped out of.
+  void append_simple_string(std::string &out, std::string_view s);
+
+  // `msg` carries its own error code, e.g. "ERR unknown command 'foo'".
+  void append_error(std::string &out, std::string_view msg);
+
+  void append_integer(std::string &out, int64_t n);
+
+  // Length-prefixed, so any byte sequence is safe: an embedded NUL, CRLF, or
+  // even an entire well-formed reply is just payload.
+  void append_bulk_string(std::string &out, std::string_view s);
+
+  // "$-1", the reply for a key that does not exist. Deliberately distinct from
+  // an empty bulk string ("$0"), which is a key that exists and holds "".
+  // GET has to be able to tell those apart.
+  void append_null_bulk(std::string &out);
+
+  // Writes the "*<n>" header only; the caller appends the n elements itself.
+  // Arrays nest, so building them incrementally avoids needing a tree type
+  // just to describe a reply.
+  void append_array_header(std::string &out, int64_t n);
+
 } // namespace cachedb

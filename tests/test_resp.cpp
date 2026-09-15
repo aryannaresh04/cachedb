@@ -3,6 +3,7 @@
 
 #include "resp.h"
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -223,4 +224,90 @@ TEST_CASE("consumed reports exactly one command") {
   CHECK(r.status == Status::Complete);
   CHECK(r.consumed == first.size());
   CHECK(c.args == Args{"PING"});
+}
+
+// ---------------------------------------------------------------------------
+// Serializer
+// ---------------------------------------------------------------------------
+
+using cachedb::append_array_header;
+using cachedb::append_bulk_string;
+using cachedb::append_error;
+using cachedb::append_integer;
+using cachedb::append_null_bulk;
+using cachedb::append_simple_string;
+
+TEST_CASE("serializing replies") {
+  std::string out;
+
+  SUBCASE("simple string") {
+    append_simple_string(out, "OK");
+    CHECK(out == "+OK\r\n");
+  }
+
+  SUBCASE("an error carries its own code") {
+    append_error(out, "ERR unknown command 'foo'");
+    CHECK(out == "-ERR unknown command 'foo'\r\n");
+  }
+
+  SUBCASE("integers, including the extremes") {
+    append_integer(out, 0);
+    append_integer(out, -1);
+    append_integer(out, INT64_MAX);
+    append_integer(out, INT64_MIN);
+    CHECK(out ==
+          ":0\r\n:-1\r\n:9223372036854775807\r\n:-9223372036854775808\r\n");
+  }
+
+  SUBCASE("bulk string") {
+    append_bulk_string(out, "hello");
+    CHECK(out == "$5\r\nhello\r\n");
+  }
+
+  SUBCASE("an empty value is a different reply from a missing key") {
+    std::string empty;
+    std::string missing;
+    append_bulk_string(empty, "");
+    append_null_bulk(missing);
+    CHECK(empty == "$0\r\n\r\n");
+    CHECK(missing == "$-1\r\n");
+    CHECK(empty != missing);
+  }
+
+  SUBCASE("a bulk string cannot escape its own framing") {
+    // A value that looks like a complete reply is still only payload: the
+    // length prefix decides where it ends, not a scan for the next CRLF.
+    const std::string evil("a\r\n+INJECTED\r\nb\0c", 17);
+    append_bulk_string(out, evil);
+    CHECK(out == std::string("$17\r\na\r\n+INJECTED\r\nb\0c\r\n", 24));
+  }
+
+  SUBCASE("array header is written on its own") {
+    append_array_header(out, 0);
+    CHECK(out == "*0\r\n");
+  }
+
+  SUBCASE("replies append rather than replace") {
+    // Three commands arriving in one read produce three replies in one buffer.
+    append_simple_string(out, "PONG");
+    append_integer(out, 2);
+    append_null_bulk(out);
+    CHECK(out == "+PONG\r\n:2\r\n$-1\r\n");
+  }
+}
+
+TEST_CASE("serialized arrays of bulk strings parse back") {
+  // An array of bulk strings is exactly the shape of a client request, so the
+  // parser doubles as a checker for the serializer: whatever we write must
+  // read back as the same arguments, binary payloads included.
+  const Args args = {"SET", "key with spaces", std::string("bin\0\r\n", 5), ""};
+
+  std::string wire;
+  append_array_header(wire, static_cast<int64_t>(args.size()));
+  for (const auto& a : args) append_bulk_string(wire, a);
+
+  const Outcome o = parse(wire);
+  CHECK(o.last == Status::NeedMoreData);
+  REQUIRE(o.commands.size() == 1);
+  CHECK(o.commands[0] == args);
 }

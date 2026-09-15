@@ -1,6 +1,7 @@
 #include "resp.h"
 
 #include <algorithm>
+#include <cassert>
 #include <charconv>
 #include <utility>
 
@@ -36,6 +37,25 @@ bool parse_i64(std::string_view s, int64_t& out) {
 }
 
 bool is_inline_space(char c) { return c == ' ' || c == '\t'; }
+
+constexpr std::string_view kCrlf = "\r\n";
+
+// to_chars rather than to_string: formats into a stack buffer instead of
+// allocating a temporary std::string for every integer reply.
+void append_i64(std::string& out, int64_t n) {
+  char buf[20];  // the widest int64 is -9223372036854775808: exactly 20 chars
+  const auto res = std::to_chars(buf, buf + sizeof(buf), n);
+  assert(res.ec == std::errc());
+  out.append(buf, static_cast<size_t>(res.ptr - buf));
+}
+
+// Guards the line-terminated reply types. Client-derived bytes must never
+// reach those (see the header), and everything else is a literal, so a debug
+// assert is the right strength: it catches the mistake in tests without
+// costing a scan of every reply in production.
+[[maybe_unused]] bool is_single_line(std::string_view s) {
+  return s.find_first_of("\r\n") == std::string_view::npos;
+}
 
 }  // namespace
 
@@ -193,6 +213,43 @@ RespParser::Result RespParser::parse(std::string_view in, Command& out) {
       }
     }
   }
+}
+
+
+void append_simple_string(std::string& out, std::string_view s) {
+  assert(is_single_line(s));
+  out += '+';
+  out.append(s);
+  out.append(kCrlf);
+}
+
+void append_error(std::string& out, std::string_view msg) {
+  assert(is_single_line(msg));
+  out += '-';
+  out.append(msg);
+  out.append(kCrlf);
+}
+
+void append_integer(std::string& out, int64_t n) {
+  out += ':';
+  append_i64(out, n);
+  out.append(kCrlf);
+}
+
+void append_bulk_string(std::string& out, std::string_view s) {
+  out += '$';
+  append_i64(out, static_cast<int64_t>(s.size()));
+  out.append(kCrlf);
+  out.append(s);
+  out.append(kCrlf);
+}
+
+void append_null_bulk(std::string& out) { out.append("$-1\r\n"); }
+
+void append_array_header(std::string& out, int64_t n) {
+  out += '*';
+  append_i64(out, n);
+  out.append(kCrlf);
 }
 
 }  // namespace cachedb
