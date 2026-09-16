@@ -63,6 +63,32 @@ namespace cachedb
     std::string_view view_;
   };
 
+  // A value together with the expiry stamp it was stored under. Returned by
+  // lookup(), which is the one place the layered walk is written.
+  struct Found
+  {
+    Value value;
+    int64_t expires_at_ms = 0; // 0 for never
+  };
+
+  // What TTL needs to answer, kept as three facts rather than one number
+  // with sentinel values, so the command layer does the formatting and this
+  // layer does not have to know that Redis spells "no key" as -2.
+  struct TtlResult
+  {
+    bool exists = false;
+    bool has_expiry = false;
+    int64_t remaining_ms = 0;
+  };
+
+  // What EXPIRE reports, split the same way DEL's answer is: whether the
+  // change is safe to acknowledge, and whether there was a key to change.
+  struct ExpireResult
+  {
+    bool durable = false;
+    bool applied = false;
+  };
+
   // What a delete reports. Two separate answers that used to be one: whether
   // the mutation is safe to acknowledge, and what DEL should reply.
   struct DelResult
@@ -117,6 +143,33 @@ namespace cachedb
     // layers cannot disagree about what time it is -- which is how a key
     // expires in one layer while the layer it was hiding keeps serving.
     std::optional<Value> get(std::string_view key) const;
+
+    // The layered walk itself, and the only copy of it. get(), exists(),
+    // ttl() and del()'s count are all three lines over this.
+    //
+    // Written once on purpose. The rules it encodes -- newest layer first, a
+    // tombstone stops the search, an expired entry stops it the same way --
+    // are subtle enough to have needed a negative control to trust, and a
+    // second copy is a second place for them to drift apart.
+    std::optional<Found> lookup(std::string_view key) const;
+
+    // Remaining lifetime, for TTL. Reads the clock here rather than handing
+    // a deadline upwards, so that judging whether a stamp has passed stays in
+    // one place.
+    TtlResult ttl(std::string_view key) const;
+
+    // Attaches an expiry to a key that already exists, as EXPIRE does.
+    //
+    // A read-modify-write and not an edit in place, because there may be
+    // nothing here to edit: the key can live only in an SSTable, and those
+    // are immutable. The value is read, then written back carrying the new
+    // stamp, which costs a full record in the log.
+    //
+    // expires_at_ms is absolute. A stamp already in the past is allowed and
+    // means the key becomes invisible at once, which is what Redis does with
+    // EXPIRE k 0.
+    [[nodiscard]] ExpireResult expire(std::string_view key,
+                                      int64_t expires_at_ms);
 
     // expires_at_ms is an absolute wall-clock stamp, not a duration; 0 means
     // never. Converting a client's "EX 10" into a point in time happens at

@@ -105,8 +105,14 @@ TEST_CASE("errors that leave the connection usable") {
           "-ERR wrong number of arguments for 'del' command\r\n");
   }
 
-  SUBCASE("SET options are refused rather than silently dropped") {
-    CHECK(run(s, {"SET", "k", "v", "EX", "10"}) == "-ERR syntax error\r\n");
+  SUBCASE("SET options we do not implement are refused, not dropped") {
+    // EX and PX are implemented; the conditional ones are not. Refusing beats
+    // accepting and ignoring: a client that asks for a conditional write and
+    // silently gets an unconditional one has a bug it cannot see.
+    CHECK(run(s, {"SET", "k", "v", "NX"}) == "-ERR syntax error\r\n");
+    CHECK(run(s, {"SET", "k", "v", "XX"}) == "-ERR syntax error\r\n");
+    CHECK(run(s, {"SET", "k", "v", "KEEPTTL"}) == "-ERR syntax error\r\n");
+    CHECK(run(s, {"SET", "k", "v", "EX"}) == "-ERR syntax error\r\n");
     CHECK(run(s, {"GET", "k"}) == "$-1\r\n");  // nothing was written
   }
 
@@ -155,4 +161,126 @@ TEST_CASE("a mutation that cannot be logged replies with an error") {
   // Reads are unaffected: nothing was applied, so the key is simply absent.
   CHECK(run(s, {"GET", "k"}) == "$-1\r\n");
   CHECK(run(s, {"EXISTS", "k"}) == ":0\r\n");
+}
+
+TEST_CASE("SET with an expiry") {
+  Store s;
+
+  SUBCASE("EX and PX both write, in their own units") {
+    CHECK(run(s, {"SET", "a", "v", "EX", "100"}) == "+OK\r\n");
+    CHECK(run(s, {"SET", "b", "v", "PX", "100000"}) == "+OK\r\n");
+    CHECK(run(s, {"GET", "a"}) == "$1\r\nv\r\n");
+    CHECK(run(s, {"GET", "b"}) == "$1\r\nv\r\n");
+    // Same lifetime expressed two ways, so the two TTLs must agree.
+    CHECK(run(s, {"TTL", "a"}) == run(s, {"TTL", "b"}));
+  }
+
+  SUBCASE("the option name is case-insensitive, as commands are") {
+    CHECK(run(s, {"SET", "a", "v", "ex", "100"}) == "+OK\r\n");
+    CHECK(run(s, {"SET", "b", "v", "Px", "100000"}) == "+OK\r\n");
+  }
+
+  SUBCASE("a non-integer expiry is an integer error, not a syntax one") {
+    CHECK(run(s, {"SET", "k", "v", "EX", "abc"}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    // Strict: a number with trailing rubbish is not a number. strtoll would
+    // have taken the 10 and ignored the rest.
+    CHECK(run(s, {"SET", "k", "v", "EX", "10abc"}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    CHECK(run(s, {"SET", "k", "v", "EX", ""}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    CHECK(run(s, {"GET", "k"}) == "$-1\r\n");  // nothing was written
+  }
+
+  SUBCASE("a non-positive expiry is refused on SET") {
+    CHECK(run(s, {"SET", "k", "v", "EX", "0"}) ==
+          "-ERR invalid expire time in 'set' command\r\n");
+    CHECK(run(s, {"SET", "k", "v", "EX", "-1"}) ==
+          "-ERR invalid expire time in 'set' command\r\n");
+  }
+
+  SUBCASE("an expiry that would overflow is refused, not wrapped") {
+    // Without the guard this lands in the past and deletes the key -- the
+    // exact opposite of what was asked, reported as +OK.
+    CHECK(run(s, {"SET", "k", "v", "EX", "9223372036854775807"}) ==
+          "-ERR invalid expire time in 'set' command\r\n");
+    CHECK(run(s, {"GET", "k"}) == "$-1\r\n");
+  }
+
+  SUBCASE("a plain overwrite drops the TTL") {
+    CHECK(run(s, {"SET", "k", "v", "EX", "100"}) == "+OK\r\n");
+    CHECK(run(s, {"SET", "k", "v2"}) == "+OK\r\n");
+    CHECK(run(s, {"TTL", "k"}) == ":-1\r\n");
+  }
+}
+
+TEST_CASE("EXPIRE and TTL") {
+  Store s;
+
+  SUBCASE("TTL reports the three cases Redis reports") {
+    CHECK(run(s, {"TTL", "missing"}) == ":-2\r\n");
+    CHECK(run(s, {"SET", "forever", "v"}) == "+OK\r\n");
+    CHECK(run(s, {"TTL", "forever"}) == ":-1\r\n");
+    CHECK(run(s, {"SET", "timed", "v", "EX", "100"}) == "+OK\r\n");
+    CHECK(run(s, {"TTL", "timed"}) == ":100\r\n");
+  }
+
+  SUBCASE("EXPIRE attaches a TTL to a key that already exists") {
+    CHECK(run(s, {"SET", "k", "v"}) == "+OK\r\n");
+    CHECK(run(s, {"EXPIRE", "k", "50"}) == ":1\r\n");
+    CHECK(run(s, {"TTL", "k"}) == ":50\r\n");
+    // The value is untouched by the read-modify-write.
+    CHECK(run(s, {"GET", "k"}) == "$1\r\nv\r\n");
+  }
+
+  SUBCASE("EXPIRE on a key that is not there changes nothing") {
+    CHECK(run(s, {"EXPIRE", "missing", "50"}) == ":0\r\n");
+    CHECK(run(s, {"GET", "missing"}) == "$-1\r\n");
+    CHECK(run(s, {"TTL", "missing"}) == ":-2\r\n");
+  }
+
+  SUBCASE("EXPIRE can replace an existing TTL") {
+    CHECK(run(s, {"SET", "k", "v", "EX", "100"}) == "+OK\r\n");
+    CHECK(run(s, {"EXPIRE", "k", "5"}) == ":1\r\n");
+    CHECK(run(s, {"TTL", "k"}) == ":5\r\n");
+  }
+
+  SUBCASE("EXPIRE with a non-positive time removes the key now") {
+    // Redis's asymmetry: non-positive is an error on SET and means "gone" on
+    // EXPIRE. Matched rather than explained away.
+    CHECK(run(s, {"SET", "k", "v"}) == "+OK\r\n");
+    CHECK(run(s, {"EXPIRE", "k", "0"}) == ":1\r\n");
+    CHECK(run(s, {"GET", "k"}) == "$-1\r\n");
+    CHECK(run(s, {"TTL", "k"}) == ":-2\r\n");
+    CHECK(run(s, {"EXISTS", "k"}) == ":0\r\n");
+  }
+
+  SUBCASE("EXPIRE rejects a non-integer and an overflowing time") {
+    CHECK(run(s, {"SET", "k", "v"}) == "+OK\r\n");
+    CHECK(run(s, {"EXPIRE", "k", "soon"}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    CHECK(run(s, {"EXPIRE", "k", "9223372036854775807"}) ==
+          "-ERR invalid expire time in 'expire' command\r\n");
+    // Neither attempt touched the key.
+    CHECK(run(s, {"TTL", "k"}) == ":-1\r\n");
+  }
+
+  SUBCASE("an expired key reads as absent everywhere") {
+    CHECK(run(s, {"SET", "k", "v"}) == "+OK\r\n");
+    CHECK(run(s, {"EXPIRE", "k", "-1"}) == ":1\r\n");
+    CHECK(run(s, {"GET", "k"}) == "$-1\r\n");
+    CHECK(run(s, {"EXISTS", "k"}) == ":0\r\n");
+    CHECK(run(s, {"TTL", "k"}) == ":-2\r\n");
+    // And DEL agrees it was already gone, rather than claiming a removal.
+    CHECK(run(s, {"DEL", "k"}) == ":0\r\n");
+  }
+
+  SUBCASE("arity is checked") {
+    CHECK(run(s, {"EXPIRE", "k"}) ==
+          "-ERR wrong number of arguments for 'expire' command\r\n");
+    CHECK(run(s, {"TTL"}) ==
+          "-ERR wrong number of arguments for 'ttl' command\r\n");
+    CHECK(run(s, {"TTL", "a", "b"}) ==
+          "-ERR wrong number of arguments for 'ttl' command\r\n");
+  }
 }

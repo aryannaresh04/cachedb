@@ -66,7 +66,7 @@ std::string Store::table_path(uint64_t sequence) const {
   return options_.dir + "/" + name;
 }
 
-std::optional<Value> Store::get(std::string_view key) const {
+std::optional<Found> Store::lookup(std::string_view key) const {
   // The clock is read at most once per lookup, and not at all unless a stamp
   // is actually met. Most keys have no expiry, and a GET that never sees one
   // should not pay for a clock read on the hottest path in the program.
@@ -91,7 +91,7 @@ std::optional<Value> Store::get(std::string_view key) const {
     // uncover the value this entry was hiding: SET k v1, flush, SET k v2 EX
     // 10, wait -- and a GET would answer v1, a value the client replaced.
     if (expired(entry->expires_at_ms)) return std::nullopt;
-    return Value::borrowed(entry->value);
+    return Found{Value::borrowed(entry->value), entry->expires_at_ms};
   }
 
   // Newest table first. The first one with anything to say about this key
@@ -102,9 +102,42 @@ std::optional<Value> Store::get(std::string_view key) const {
     if (!found.found) continue;
     if (found.tombstone) return std::nullopt;
     if (expired(found.expires_at_ms)) return std::nullopt;
-    return Value::owned(std::move(found.value));
+    return Found{Value::owned(std::move(found.value)), found.expires_at_ms};
   }
   return std::nullopt;
+}
+
+std::optional<Value> Store::get(std::string_view key) const {
+  std::optional<Found> found = lookup(key);
+  if (!found) return std::nullopt;
+  return std::move(found->value);
+}
+
+TtlResult Store::ttl(std::string_view key) const {
+  const std::optional<Found> found = lookup(key);
+  if (!found) return {};  // exists = false, which TTL reports as -2
+  if (found->expires_at_ms == 0) return {true, false, 0};
+
+  // lookup() already refused to return anything whose stamp had passed, so
+  // this cannot be negative by the time it is read. Clamped at zero anyway:
+  // the clock is read twice across the two calls and could step between them.
+  const int64_t remaining = found->expires_at_ms - now_ms();
+  return {true, true, remaining > 0 ? remaining : 0};
+}
+
+ExpireResult Store::expire(std::string_view key,
+                                  int64_t expires_at_ms) {
+  const std::optional<Found> found = lookup(key);
+  if (!found) return {true, false};  // nothing to expire; EXPIRE replies :0
+
+  // Copied out before the write, not viewed across it. On a memtable hit the
+  // value borrows the entry's own std::string, and set() assigns over that
+  // same string -- which may reallocate, leaving the view dangling. The copy
+  // is the whole reason this is not a two-line function.
+  const std::string value(found->value.get());
+
+  if (!set(key, value, expires_at_ms)) return {false, false};
+  return {true, true};
 }
 
 bool Store::set(std::string_view key, std::string_view value,
