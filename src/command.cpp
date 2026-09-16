@@ -69,7 +69,13 @@ void cmd_set(const Command& c, Store& store, std::string& out) {
     append_error(out, "ERR syntax error");
     return;
   }
-  store.set(c.args[1], c.args[2]);
+  if (!store.set(c.args[1], c.args[2])) {
+    // The log write failed, so the store was not touched. Saying so is the
+    // point of the whole exercise: an acknowledged write that did not happen
+    // is the one failure a database may not have.
+    append_error(out, "ERR the write could not be logged and was not applied");
+    return;
+  }
   append_simple_string(out, "OK");
 }
 
@@ -85,7 +91,23 @@ void cmd_get(const Command& c, Store& store, std::string& out) {
 void cmd_del(const Command& c, Store& store, std::string& out) {
   int64_t removed = 0;
   for (size_t i = 1; i < c.args.size(); ++i) {
-    if (store.del(c.args[i])) ++removed;
+    const DelResult r = store.del(c.args[i]);
+    if (!r.durable) {
+      // Multi-key DEL is not atomic across a log failure. Keys earlier in the
+      // argument list are already deleted and already logged; this one is not,
+      // and the remaining ones were never attempted. Replying with the count
+      // so far would read as "these succeeded and the rest did not exist",
+      // which is a different and false statement -- so the command reports an
+      // error and the client re-reads to find out where it stopped.
+      //
+      // Making it atomic needs the log to accept a batch that replays all or
+      // nothing, which is a real feature and not one M2 promises.
+      append_error(out,
+                   "ERR the delete could not be logged; this command was "
+                   "applied only in part");
+      return;
+    }
+    if (r.was_live) ++removed;
   }
   append_integer(out, removed);
 }

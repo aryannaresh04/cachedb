@@ -3,12 +3,16 @@
 
 #include "command.h"
 
+#include <unistd.h>
+
 #include <string>
 #include <utility>
 #include <vector>
 
 using cachedb::Command;
 using cachedb::Store;
+using cachedb::SyncPolicy;
+using cachedb::Wal;
 
 namespace {
 
@@ -128,4 +132,24 @@ TEST_CASE("an error reply cannot be forged by the command name") {
   // Exactly one terminator, and it sits at the end: one reply, not two.
   CHECK(reply.find("\r\n") == reply.size() - 2);
   CHECK(reply == "-ERR unknown command 'BOGUS..+INJECTED'\r\n");
+}
+
+TEST_CASE("a mutation that cannot be logged replies with an error") {
+  // See test_store.cpp for why /dev/full: it fails every write with ENOSPC,
+  // so the durability path can be exercised without a fake. Linux only.
+  if (::access("/dev/full", W_OK) != 0) return;
+
+  Wal wal("/dev/full", SyncPolicy::kNo);
+  Store s(&wal);
+
+  CHECK(run(s, {"SET", "k", "v"}) ==
+        "-ERR the write could not be logged and was not applied\r\n");
+  // Not ":0". A delete that was not logged has not happened, and reporting a
+  // count would say it had.
+  CHECK(run(s, {"DEL", "k"}) ==
+        "-ERR the delete could not be logged; this command was applied only "
+        "in part\r\n");
+  // Reads are unaffected: nothing was applied, so the key is simply absent.
+  CHECK(run(s, {"GET", "k"}) == "$-1\r\n");
+  CHECK(run(s, {"EXISTS", "k"}) == ":0\r\n");
 }

@@ -10,7 +10,38 @@ std::optional<std::string_view> Store::get(std::string_view key) const {
   return std::string_view(it->second.value);
 }
 
-void Store::set(std::string_view key, std::string_view value) {
+bool Store::set(std::string_view key, std::string_view value) {
+  // The log entry goes down before the table changes, and that ordering is
+  // the entire durability guarantee. Crash between the two and replay puts
+  // the write back. Do it the other way round and a crash leaves a write that
+  // was acknowledged and is gone -- which is the one outcome a database is
+  // not allowed to have.
+  if (wal_ && !wal_->append(Record::Op::kSet, key, value)) return false;
+  apply_set(key, value);
+  return true;
+}
+
+DelResult Store::del(std::string_view key) {
+  // A tombstone is a log record like any other, for the same reason it is a
+  // table entry like any other: from M3 the key may still live in an SSTable,
+  // and the tombstone is the only thing that will hide it.
+  if (wal_ && !wal_->append(Record::Op::kDelete, key, "")) return {};
+  return {true, apply_del(key)};
+}
+
+void Store::apply(const Record& record) {
+  switch (record.op) {
+    case Record::Op::kSet:
+      apply_set(record.key, record.value);
+      break;
+    case Record::Op::kDelete:
+      // The return is the DEL reply count, which recovery has nobody to tell.
+      apply_del(record.key);
+      break;
+  }
+}
+
+void Store::apply_set(std::string_view key, std::string_view value) {
   const auto it = entries_.find(key);
   if (it == entries_.end()) {
     entries_.emplace(std::string(key), Entry{std::string(value), false});
@@ -26,7 +57,7 @@ void Store::set(std::string_view key, std::string_view value) {
   it->second.value.assign(value);
 }
 
-bool Store::del(std::string_view key) {
+bool Store::apply_del(std::string_view key) {
   const auto it = entries_.find(key);
   const bool was_live = it != entries_.end() && !it->second.tombstone;
   if (was_live) --live_count_;
