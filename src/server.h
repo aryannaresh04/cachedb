@@ -8,6 +8,7 @@
 #include "connection.h"
 #include "fd.h"
 #include "store.h"
+#include "wal.h"
 
 namespace cachedb
 {
@@ -21,7 +22,10 @@ namespace cachedb
   public:
     // Throws on any setup failure. A port already in use is a startup problem
     // for the operator to fix, not a condition to recover from.
-    Server(Store &store, uint16_t port);
+    //
+    // Borrows both; each must outlive the Server. The log is here only so the
+    // loop can drive maybe_sync() -- writes reach it through the Store.
+    Server(Store &store, Wal &wal, uint16_t port);
 
     // Runs until the process is killed.
     void run();
@@ -44,6 +48,7 @@ namespace cachedb
     void close_connection(int fd);
 
     Store &store_;
+    Wal &wal_;
     Fd epoll_;
     Fd listener_;
     std::unordered_map<int, ConnState> conns_;

@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -20,13 +21,24 @@ constexpr int kMaxEvents = 256;
 // Reused for every read, so a connection costs no per-read allocation.
 constexpr size_t kReadChunk = 16 * 1024;
 
+// How long epoll_wait may block with nothing happening. 100 ms is the same
+// 10 Hz real Redis runs its cron at.
+//
+// It has to be finite. Under the everysec policy this tick is the only thing
+// that forces the log down, and from M4 it is also what drives active expiry;
+// with an infinite wait neither would fire on a server nobody is talking to --
+// exactly the quiet period where the power is most likely to go out. Ten idle
+// wakeups a second costs nothing measurable.
+constexpr int kTickMs = 100;
+
 [[noreturn]] void throw_errno(const char* what) {
   throw std::system_error(errno, std::generic_category(), what);
 }
 
 }  // namespace
 
-Server::Server(Store& store, uint16_t port) : store_(store) {
+Server::Server(Store& store, Wal& wal, uint16_t port)
+    : store_(store), wal_(wal) {
   listener_.reset(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
   if (!listener_.valid()) throw_errno("socket");
 
@@ -66,8 +78,8 @@ Server::Server(Store& store, uint16_t port) : store_(store) {
 void Server::run() {
   std::vector<epoll_event> events(kMaxEvents);
   for (;;) {
-    const int n =
-        ::epoll_wait(epoll_.get(), events.data(), kMaxEvents, /*timeout=*/-1);
+    const int n = ::epoll_wait(epoll_.get(), events.data(), kMaxEvents,
+                               /*timeout=*/kTickMs);
     if (n < 0) {
       // A signal arriving during the wait is routine, not a failure.
       if (errno == EINTR) continue;
@@ -79,6 +91,19 @@ void Server::run() {
       } else {
         service(events[i].data.fd, events[i].events);
       }
+    }
+
+    // Once per tick regardless of whether anything happened, including when
+    // epoll_wait returned on the timeout with n == 0. Under always and no this
+    // returns immediately; under everysec it is the entire policy.
+    if (!wal_.maybe_sync()) {
+      // These writes were acknowledged up to a second ago and cannot be made
+      // durable after the fact -- which is precisely the bargain everysec
+      // offers. Saying so loudly is all that is left. A production system
+      // would stop accepting writes here; see PROJECT.md 6.1.
+      std::fprintf(stderr,
+                   "cachedb: WAL fsync failed, acknowledged writes may be "
+                   "lost\n");
     }
   }
 }
