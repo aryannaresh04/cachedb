@@ -81,7 +81,9 @@ int main(int argc, char** argv) {
     }
     const std::string wal_path = dir + "/wal.log";
 
-    cachedb::Store store;
+    cachedb::StoreOptions store_options;
+    store_options.dir = dir;
+    cachedb::Store store(store_options);
 
     // Recovery runs before the listener exists, so no client can read a state
     // that is still being rebuilt.
@@ -112,8 +114,11 @@ int main(int argc, char** argv) {
 
     cachedb::install_shutdown_handlers();
     cachedb::Server server(store, wal, port);
-    std::fprintf(stderr, "cachedb listening on 127.0.0.1:%u, %zu keys, log %s\n",
-                 port, store.size(), wal_path.c_str());
+    std::fprintf(
+        stderr,
+        "cachedb listening on 127.0.0.1:%u, %zu keys in memory, %zu sstables, "
+        "log %s\n",
+        port, store.memtable_keys(), store.sstable_count(), wal_path.c_str());
     server.run();
   } catch (const std::exception& e) {
     // Startup failures are the exceptional case PROJECT.md 11 allows

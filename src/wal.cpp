@@ -228,6 +228,18 @@ bool Wal::sync() {
   return true;
 }
 
+bool Wal::truncate() {
+  if (::ftruncate(fd_.get(), 0) != 0) return false;
+  // O_APPEND means the next write finds the new end by itself, so there is no
+  // offset to reset -- only the cached length.
+  size_ = 0;
+  bytes_since_sync_ = 0;
+  // The truncation itself has to be durable. Otherwise a crash could leave the
+  // old records still readable, and they would replay on top of a table that
+  // already contains them.
+  return sync();
+}
+
 bool Wal::maybe_sync() {
   if (policy_ != SyncPolicy::kEverySec) return true;
 

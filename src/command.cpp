@@ -83,7 +83,7 @@ void cmd_set(const Command& c, Store& store, std::string& out) {
 void cmd_get(const Command& c, Store& store, std::string& out) {
   const auto value = store.get(c.args[1]);
   if (value) {
-    append_bulk_string(out, *value);
+    append_bulk_string(out, value->get());
   } else {
     append_null_bulk(out);
   }

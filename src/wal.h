@@ -161,6 +161,14 @@ namespace cachedb
     // explicit request, not a suggestion.
     bool sync();
 
+    // Empties the log. Called after a flush has put the memtable's contents
+    // safely into an SSTable, at which point every record in here is
+    // redundant.
+    //
+    // Only ever safe in that order. Truncating before the table is durable
+    // would leave a crash window where the data is in neither place.
+    [[nodiscard]] bool truncate();
+
     SyncPolicy policy() const { return policy_; }
 
     // How many fsyncs have actually been issued. Exposed because the whole
