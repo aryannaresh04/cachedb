@@ -60,6 +60,12 @@ uint64_t load_u64(const char* p) {
   return v;
 }
 
+// The op byte for a SET that carries an expiry. Deliberately not a value in
+// Record::Op: it exists only between encode_record and decode_record, and
+// putting it in the enum would oblige every switch on an op to handle a case
+// that means the same thing as kSet.
+constexpr uint8_t kSetExOpByte = 2;
+
 int64_t now_ms() {
   // system_clock, not steady_clock: this timestamp outlives the process and
   // becomes an absolute expiry point at M4, so it has to mean something to the
@@ -106,15 +112,25 @@ uint32_t crc32(std::string_view data) {
 }
 
 void encode_record(std::string& out, Record::Op op, int64_t timestamp_ms,
-                   std::string_view key, std::string_view value) {
+                   std::string_view key, std::string_view value,
+                   int64_t expires_at_ms) {
+  // The op that goes on the wire is derived here rather than asked for, so a
+  // caller cannot pair an expiry with an op that has nowhere to put it. Only
+  // a SET can carry one: an expiring tombstone is a deleted key coming back.
+  const bool carries_expiry =
+      op == Record::Op::kSet && expires_at_ms != 0;
+  const uint8_t op_byte =
+      carries_expiry ? kSetExOpByte : static_cast<uint8_t>(op);
+
   const size_t crc_pos = out.size();
   put_u32(out, 0);  // placeholder; the checksum is only known once the rest is
 
   const size_t covered_from = out.size();
   put_u64(out, static_cast<uint64_t>(timestamp_ms));
-  out.push_back(static_cast<char>(op));
+  out.push_back(static_cast<char>(op_byte));
   put_u32(out, static_cast<uint32_t>(key.size()));
   put_u32(out, static_cast<uint32_t>(value.size()));
+  if (carries_expiry) put_u64(out, static_cast<uint64_t>(expires_at_ms));
   out.append(key);
   out.append(value);
 
@@ -135,9 +151,18 @@ DecodeResult decode_record(std::string_view in) {
   const uint32_t klen = load_u32(in.data() + 13);
   const uint32_t vlen = load_u32(in.data() + 17);
 
+  // How much sits between the header and the key depends on the op, so the
+  // length cannot be known before the op byte is read. An op we do not
+  // recognise is charged nothing extra deliberately: that reproduces exactly
+  // the arithmetic used before this op existed, so a short buffer with a
+  // damaged op byte still reports Incomplete rather than changing its answer
+  // to Corrupt. The op is judged below, in its old place, after the checksum.
+  const size_t extra = op_byte == kSetExOpByte ? kExpirySize : 0;
+
   // Lengths are claims made by bytes that may themselves be wreckage. Widen to
   // 64 bits so the sum cannot wrap, and compare before believing either one.
   const uint64_t total = static_cast<uint64_t>(kRecordHeaderSize) +
+                         static_cast<uint64_t>(extra) +
                          static_cast<uint64_t>(klen) +
                          static_cast<uint64_t>(vlen);
   if (in.size() < total) return {DecodeStatus::Incomplete, 0, {}};
@@ -150,17 +175,26 @@ DecodeResult decode_record(std::string_view in) {
   // The checksum already passed, so an op we do not recognise means the file
   // was written by a different version, not that it was damaged. Either way
   // there is nothing sensible to replay.
-  if (op_byte > static_cast<unsigned char>(Record::Op::kDelete)) {
+  if (op_byte > kSetExOpByte) {
     return {DecodeStatus::Corrupt, 0, {}};
   }
 
   DecodeResult result;
   result.status = DecodeStatus::Ok;
   result.consumed = size;
-  result.record.op = static_cast<Record::Op>(op_byte);
   result.record.timestamp_ms = static_cast<int64_t>(timestamp);
-  result.record.key = in.substr(kRecordHeaderSize, klen);
-  result.record.value = in.substr(kRecordHeaderSize + klen, vlen);
+  // The wire op is unfolded back into a plain kSet plus a stamp, so nothing
+  // above this line has to know that a third op byte exists.
+  if (op_byte == kSetExOpByte) {
+    result.record.op = Record::Op::kSet;
+    result.record.expires_at_ms =
+        static_cast<int64_t>(load_u64(in.data() + kRecordHeaderSize));
+  } else {
+    result.record.op = static_cast<Record::Op>(op_byte);
+  }
+  const size_t body = kRecordHeaderSize + extra;
+  result.record.key = in.substr(body, klen);
+  result.record.value = in.substr(body + klen, vlen);
   return result;
 }
 
@@ -180,9 +214,10 @@ Wal::Wal(const std::string& path, SyncPolicy policy,
   size_ = static_cast<uint64_t>(end);
 }
 
-bool Wal::append(Record::Op op, std::string_view key, std::string_view value) {
+bool Wal::append(Record::Op op, std::string_view key, std::string_view value,
+                 int64_t expires_at_ms) {
   buf_.clear();
-  encode_record(buf_, op, now_ms(), key, value);
+  encode_record(buf_, op, now_ms(), key, value, expires_at_ms);
   if (!write_all(fd_.get(), buf_)) return false;
   size_ += buf_.size();
   bytes_since_sync_ += buf_.size();
@@ -200,7 +235,7 @@ bool Wal::append_batch(const std::vector<Mutation>& mutations) {
   // exist.
   const int64_t now = now_ms();
   for (const Mutation& m : mutations) {
-    encode_record(buf_, m.op, now, m.key, m.value);
+    encode_record(buf_, m.op, now, m.key, m.value, m.expires_at_ms);
   }
 
   if (!write_all(fd_.get(), buf_)) return false;

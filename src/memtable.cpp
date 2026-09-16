@@ -8,7 +8,13 @@ namespace {
 // What one entry costs regardless of how long its key and value are: the
 // red-black tree node (a colour and three pointers), the two std::string
 // objects living inside it, and the allocator's header on the node itself.
-constexpr size_t kEntryOverhead = 120;
+//
+// 120 was measured against real RSS. The expiry stamp added 8 to it and not
+// zero: an Entry had a bool followed by padding, but the padding sat at the
+// end of the object rather than inside it, so the int64 extended the node
+// rather than fitting in a hole. Measured, not assumed -- sizeof the tree
+// node on Linux/libstdc++ went from 104 to 112.
+constexpr size_t kEntryOverhead = 128;
 
 // Up to this length a std::string keeps its bytes inside the object under the
 // small-string optimisation, so they are already counted in kEntryOverhead and
@@ -43,10 +49,12 @@ const Memtable::Entry* Memtable::find(std::string_view key) const {
   return it == entries_.end() ? nullptr : &it->second;
 }
 
-void Memtable::set(std::string_view key, std::string_view value) {
+void Memtable::set(std::string_view key, std::string_view value,
+                   int64_t expires_at_ms) {
   const auto it = entries_.find(key);
   if (it == entries_.end()) {
-    entries_.emplace(std::string(key), Entry{std::string(value), false});
+    entries_.emplace(std::string(key),
+                     Entry{std::string(value), false, expires_at_ms});
     ++live_count_;
     bytes_ += entry_cost(key, value);
     return;
@@ -66,6 +74,7 @@ void Memtable::set(std::string_view key, std::string_view value) {
   // that reads low is the one failure mode worth avoiding here.
   const size_t old_cost = heap_cost(it->second.value.size());
   it->second.value.assign(value);
+  it->second.expires_at_ms = expires_at_ms;
   const size_t new_cost = heap_cost(value.size());
   if (new_cost > old_cost) bytes_ += new_cost - old_cost;
 }
@@ -79,7 +88,7 @@ bool Memtable::del(std::string_view key) {
     // The tombstone goes in even though the key is not here, and from M3 that
     // is the entire point: the key may still sit in an SSTable this table has
     // never seen, and this marker is what will hide it from a read.
-    entries_.emplace(std::string(key), Entry{std::string(), true});
+    entries_.emplace(std::string(key), Entry{std::string(), true, 0});
     bytes_ += entry_cost(key, "");
     return was_live;
   }
@@ -88,6 +97,10 @@ bool Memtable::del(std::string_view key) {
   // its buffer back, so those bytes are still held until the table is cleared.
   it->second.value.clear();
   it->second.tombstone = true;
+  // A tombstone with an expiry is a contradiction -- it says "absent, until
+  // it stops being absent". Clearing it keeps the flag the only thing a
+  // reader has to consult once the marker is set.
+  it->second.expires_at_ms = 0;
   return was_live;
 }
 

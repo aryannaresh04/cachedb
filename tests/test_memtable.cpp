@@ -189,3 +189,77 @@ TEST_CASE("an entry stays put while other keys are written") {
   CHECK(e->value == "value");
   CHECK(e == m.find("k"));
 }
+
+TEST_CASE("an expiry is stored, and never interpreted") {
+  // The memtable holds the stamp and nothing more. Comparing it against a
+  // clock is Store's job, so that the memtable and the SSTables underneath it
+  // cannot disagree about what time it is -- which is how a key expires in
+  // one layer while the layer it was hiding is still serving the old value.
+  Memtable m;
+  m.set("k", "v", 1700000000000);
+
+  const auto* e = m.find("k");
+  REQUIRE(e != nullptr);
+  CHECK(e->expires_at_ms == 1700000000000);
+  // Long past, and the memtable still reports it live. Nothing here reads a
+  // clock, so nothing here can decide otherwise.
+  CHECK(m.live_count() == 1);
+}
+
+TEST_CASE("a key written with no expiry has none") {
+  Memtable m;
+  m.set("k", "v");
+  const auto* e = m.find("k");
+  REQUIRE(e != nullptr);
+  CHECK(e->expires_at_ms == 0);
+}
+
+TEST_CASE("a plain overwrite drops an existing expiry") {
+  // Redis's rule, and a behaviour rather than an accident: SET without EX
+  // clears the TTL. Carrying the old stamp forward would look conservative
+  // and would in fact be wrong -- a client that rewrites a key to keep it
+  // would watch it vanish on the old schedule.
+  Memtable m;
+  m.set("k", "v", 1700000000000);
+  m.set("k", "v2");
+
+  const auto* e = m.find("k");
+  REQUIRE(e != nullptr);
+  CHECK(e->value == "v2");
+  CHECK(e->expires_at_ms == 0);
+}
+
+TEST_CASE("an overwrite can replace one expiry with another") {
+  Memtable m;
+  m.set("k", "v", 1000);
+  m.set("k", "v", 2000);
+  const auto* e = m.find("k");
+  REQUIRE(e != nullptr);
+  CHECK(e->expires_at_ms == 2000);
+}
+
+TEST_CASE("a tombstone carries no expiry") {
+  // "Absent, until it stops being absent" is not a state this engine has. If
+  // a stale stamp survived on a tombstone, a later reader that checked the
+  // expiry before the flag would resurrect a deleted key.
+  Memtable m;
+  m.set("k", "v", 1700000000000);
+  CHECK(m.del("k"));
+
+  const auto* e = m.find("k");
+  REQUIRE(e != nullptr);
+  CHECK(e->tombstone);
+  CHECK(e->expires_at_ms == 0);
+}
+
+TEST_CASE("writing over a tombstone can set an expiry") {
+  Memtable m;
+  CHECK_FALSE(m.del("k"));
+  m.set("k", "v", 4242);
+
+  const auto* e = m.find("k");
+  REQUIRE(e != nullptr);
+  CHECK_FALSE(e->tombstone);
+  CHECK(e->expires_at_ms == 4242);
+  CHECK(m.live_count() == 1);
+}

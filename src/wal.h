@@ -26,6 +26,25 @@ namespace cachedb
   //
   //   [crc32: 4][timestamp_ms: 8][op: 1][klen: 4][vlen: 4][key][value]
   //
+  // A SET carrying an expiry is written with a third op byte and eight more
+  // bytes between the header and the key (PROJECT.md 6.8):
+  //
+  //   [crc32: 4][timestamp_ms: 8][op: 2][klen: 4][vlen: 4]
+  //   [expires_at_ms: 8][key][value]
+  //
+  // That third op is a wire detail and nothing more -- it never reaches this
+  // struct. A decoded record says kSet with a non-zero expires_at_ms, and the
+  // encoder picks the op byte back out of that. Keeping it out of the enum
+  // means no switch anywhere gains a third case duplicating kSet, and no
+  // caller can hand in an expiry alongside the wrong op and watch it be
+  // dropped without a word.
+  //
+  // A new op rather than a new field, because a field would be paid for by
+  // every DELETE and every SET that has no expiry, and would make every log
+  // written before today unreadable. decode_record already treats an op it
+  // does not recognise as Corrupt, so an older reader rejects a newer record
+  // loudly instead of misparsing it.
+  //
   // Little-endian, written byte by byte rather than copied out of a struct, so
   // the format does not change with the host's byte order or padding rules.
   //
@@ -41,18 +60,34 @@ namespace cachedb
     };
 
     Op op = Op::kSet;
+    // When the record was written. Distinct from expires_at_ms, which is when
+    // the key it carries stops being visible.
     int64_t timestamp_ms = 0;
+    // Wall-clock milliseconds after which the key is gone, or 0 for never.
+    // Only ever set on a kSet: a tombstone that expired would be a deleted
+    // key coming back.
+    int64_t expires_at_ms = 0;
     // Views into the buffer passed to decode_record, valid only as long as it
     // is. A replay holds the file contents alive across the whole scan.
     std::string_view key;
     std::string_view value;
   };
 
-  // Header is crc(4) + timestamp(8) + op(1) + klen(4) + vlen(4).
+  // Header is crc(4) + timestamp(8) + op(1) + klen(4) + vlen(4). This is both
+  // the smallest a record can be and the amount that has to be in hand before
+  // its true length is knowable, which is why the lengths live inside it.
   inline constexpr size_t kRecordHeaderSize = 21;
 
+  // What a record carrying an expiry spends on top of that, sitting between
+  // the header and the key.
+  inline constexpr size_t kExpirySize = 8;
+
+  // A non-zero expires_at_ms on a kSet selects the wire op that can carry it.
+  // Passing one with kDelete is ignored: a tombstone has no lifetime of its
+  // own, and giving it one would mean a deleted key reappearing.
   void encode_record(std::string &out, Record::Op op, int64_t timestamp_ms,
-                     std::string_view key, std::string_view value);
+                     std::string_view key, std::string_view value,
+                     int64_t expires_at_ms = 0);
 
   enum class DecodeStatus
   {
@@ -125,7 +160,8 @@ namespace cachedb
     // Appends one mutation. Returns false if the bytes did not reach the
     // kernel -- or, under kAlways, the disk. A false here must stop the caller
     // acknowledging the write, which is the whole point of the log.
-    bool append(Record::Op op, std::string_view key, std::string_view value);
+    bool append(Record::Op op, std::string_view key, std::string_view value,
+                int64_t expires_at_ms = 0);
 
     // One mutation inside a batch.
     struct Mutation
@@ -133,6 +169,7 @@ namespace cachedb
       Record::Op op = Record::Op::kSet;
       std::string_view key;
       std::string_view value;
+      int64_t expires_at_ms = 0;
     };
 
     // Appends every mutation as a single write() and a single fsync.

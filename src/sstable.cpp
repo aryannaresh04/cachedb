@@ -14,6 +14,7 @@ namespace {
 using sstable::kFooterSize;
 using sstable::kIndexInterval;
 using sstable::kMagic;
+using sstable::kMagicV1;
 
 void put_u32(std::string& out, uint32_t v) {
   for (int shift = 0; shift < 32; shift += 8) {
@@ -84,6 +85,11 @@ bool read_exact(int fd, uint64_t offset, size_t length, std::string* out) {
 
 constexpr unsigned char kTombstoneFlag = 0x01;
 
+// Bit 1: an 8-byte expiry sits between the flags byte and the key. Spending a
+// spare bit rather than eight bytes on every entry keeps a key with no TTL --
+// which is most of them -- costing exactly what it cost before.
+constexpr unsigned char kExpiryFlag = 0x02;
+
 }  // namespace
 
 SstableWriter::SstableWriter(const std::string& path, int bits_per_key)
@@ -93,13 +99,20 @@ SstableWriter::SstableWriter(const std::string& path, int bits_per_key)
 }
 
 void SstableWriter::add(std::string_view key, std::string_view value,
-                        bool tombstone) {
+                        bool tombstone, int64_t expires_at_ms) {
   if (failed_) return;  // nothing to gain by writing past a failure
+
+  // Same rule as the log: a tombstone with a lifetime would be a deleted key
+  // scheduled to come back. Dropped here rather than trusted not to arrive.
+  const bool carries_expiry = !tombstone && expires_at_ms != 0;
 
   buf_.clear();
   put_u32(buf_, static_cast<uint32_t>(key.size()));
   put_u32(buf_, static_cast<uint32_t>(value.size()));
-  buf_.push_back(static_cast<char>(tombstone ? kTombstoneFlag : 0));
+  unsigned char flags = tombstone ? kTombstoneFlag : 0;
+  if (carries_expiry) flags |= kExpiryFlag;
+  buf_.push_back(static_cast<char>(flags));
+  if (carries_expiry) put_u64(buf_, static_cast<uint64_t>(expires_at_ms));
   buf_.append(key);
   buf_.append(value);
 
@@ -179,7 +192,10 @@ Sstable::Sstable(const std::string& path, bool use_bloom)
                   kFooterSize, &footer)) {
     throw_errno("read footer", path);
   }
-  if (std::memcmp(footer.data() + 24, kMagic, sizeof(kMagic)) != 0) {
+  // v1 is still read, so a table written before entries could expire keeps
+  // serving rather than a format change costing a wipe. Only v2 is written.
+  if (std::memcmp(footer.data() + 24, kMagic, sizeof(kMagic)) != 0 &&
+      std::memcmp(footer.data() + 24, kMagicV1, sizeof(kMagicV1)) != 0) {
     throw_format("not a cachedb sstable, or a version we do not know", path);
   }
 
@@ -264,7 +280,14 @@ Sstable::Lookup Sstable::get(std::string_view key) const {
     const uint32_t vlen = load_u32(block.data() + pos + 4);
     const unsigned char flags =
         static_cast<unsigned char>(block[pos + 8]);
-    const size_t body = pos + 9;
+    // The expiry, when present, sits between the flags byte and the key, so
+    // where the key starts depends on a bit we have only just read.
+    const bool has_expiry = (flags & kExpiryFlag) != 0;
+    const size_t stamp = pos + 9;
+    const size_t body = stamp + (has_expiry ? 8 : 0);
+    // Checked before the stamp is loaded, not after: an entry claiming an
+    // expiry it does not have room for would otherwise read eight bytes off
+    // the end of the block.
     if (body + klen + vlen > block.size()) break;  // truncated, stop believing
 
     const std::string_view entry_key(block.data() + body, klen);
@@ -272,6 +295,10 @@ Sstable::Lookup Sstable::get(std::string_view key) const {
       Lookup found;
       found.found = true;
       found.tombstone = (flags & kTombstoneFlag) != 0;
+      if (has_expiry) {
+        found.expires_at_ms =
+            static_cast<int64_t>(load_u64(block.data() + stamp));
+      }
       if (!found.tombstone) found.value.assign(block, body + klen, vlen);
       return found;
     }

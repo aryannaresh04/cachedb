@@ -43,12 +43,14 @@ struct Entry {
   Record::Op op;
   std::string key;
   std::string value;
+  int64_t expires_at_ms = 0;
 };
 
 std::vector<Entry> drain(const std::string& path, ReplayResult* out = nullptr) {
   std::vector<Entry> got;
   const ReplayResult r = replay(path, [&](const Record& rec) {
-    got.push_back({rec.op, std::string(rec.key), std::string(rec.value)});
+    got.push_back({rec.op, std::string(rec.key), std::string(rec.value),
+                   rec.expires_at_ms});
   });
   if (out) *out = r;
   return got;
@@ -472,4 +474,128 @@ TEST_CASE("the sync count matches what each policy promises") {
     REQUIRE(wal.sync());
     CHECK(wal.syncs() == 2);
   }
+}
+
+TEST_CASE("an expiry survives the round trip") {
+  std::string buf;
+  encode_record(buf, Record::Op::kSet, 1234, "k", "v", 1700000000000);
+
+  const auto r = decode_record(buf);
+  REQUIRE(r.status == DecodeStatus::Ok);
+  CHECK(r.consumed == buf.size());
+  // A plain kSet comes back out, not a third op. Nothing above the codec has
+  // to know the wire spends an extra byte value on this.
+  CHECK(r.record.op == Record::Op::kSet);
+  CHECK(r.record.key == "k");
+  CHECK(r.record.value == "v");
+  CHECK(r.record.expires_at_ms == 1700000000000);
+  // And the write time is still its own field, unconfused with the expiry.
+  CHECK(r.record.timestamp_ms == 1234);
+}
+
+TEST_CASE("a record with no expiry is byte-for-byte what it always was") {
+  // The compatibility claim, made concrete: adding the op must not change a
+  // single byte of a record that does not use it, or every log written before
+  // today would stop replaying.
+  std::string with_zero;
+  encode_record(with_zero, Record::Op::kSet, 99, "key", "value", 0);
+  std::string without;
+  encode_record(without, Record::Op::kSet, 99, "key", "value");
+
+  CHECK(with_zero == without);
+  CHECK(with_zero.size() == kRecordHeaderSize + 3 + 5);
+  CHECK(static_cast<unsigned char>(with_zero[12]) == 0);
+}
+
+TEST_CASE("an expiring record spends exactly eight more bytes") {
+  std::string plain;
+  encode_record(plain, Record::Op::kSet, 0, "key", "value");
+  std::string expiring;
+  encode_record(expiring, Record::Op::kSet, 0, "key", "value", 5000);
+
+  CHECK(expiring.size() == plain.size() + cachedb::kExpirySize);
+  CHECK(static_cast<unsigned char>(expiring[12]) == 2);
+}
+
+TEST_CASE("a delete cannot be given an expiry") {
+  // An expiring tombstone is a deleted key that comes back. The encoder drops
+  // the stamp rather than trusting the caller not to pass one.
+  std::string buf;
+  encode_record(buf, Record::Op::kDelete, 0, "k", "", 5000);
+
+  CHECK(static_cast<unsigned char>(buf[12]) == 1);
+  const auto r = decode_record(buf);
+  REQUIRE(r.status == DecodeStatus::Ok);
+  CHECK(r.record.op == Record::Op::kDelete);
+  CHECK(r.record.expires_at_ms == 0);
+}
+
+TEST_CASE("a torn expiring record is incomplete at every prefix") {
+  // The header grew for this op, so the "do I have enough bytes yet" check
+  // had to grow with it. If it had not, a prefix that stops inside the expiry
+  // would be read as a whole record with a key made of whatever followed.
+  std::string buf;
+  encode_record(buf, Record::Op::kSet, 0, "key", "value", 1700000000000);
+
+  for (size_t n = 0; n < buf.size(); ++n) {
+    const auto r = decode_record(std::string_view(buf).substr(0, n));
+    CHECK(r.status == DecodeStatus::Incomplete);
+  }
+  CHECK(decode_record(buf).status == DecodeStatus::Ok);
+}
+
+TEST_CASE("the expiry is covered by the checksum") {
+  std::string buf;
+  encode_record(buf, Record::Op::kSet, 0, "key", "value", 1700000000000);
+  // Flip a bit inside the stamp itself, which lives between the header and
+  // the key and would otherwise be the one field nothing verifies.
+  buf[kRecordHeaderSize] = static_cast<char>(buf[kRecordHeaderSize] ^ 0x01);
+
+  CHECK(decode_record(buf).status == DecodeStatus::Corrupt);
+}
+
+TEST_CASE("an op byte beyond the ones we know is still corrupt") {
+  // The accepted range widened by exactly one. It did not open.
+  std::string buf;
+  encode_record(buf, Record::Op::kSet, 0, "k", "v");
+  buf[12] = 3;
+
+  CHECK(decode_record(buf).status == DecodeStatus::Corrupt);
+}
+
+TEST_CASE("expiries survive a real file and a reopen") {
+  TempLog log("expiry");
+  {
+    cachedb::Wal wal(log.path, SyncPolicy::kNo);
+    CHECK(wal.append(Record::Op::kSet, "plain", "v"));
+    CHECK(wal.append(Record::Op::kSet, "expiring", "v", 1700000000000));
+    CHECK(wal.append(Record::Op::kDelete, "gone", ""));
+  }
+
+  const auto got = drain(log.path);
+  REQUIRE(got.size() == 3);
+  CHECK(got[0].key == "plain");
+  CHECK(got[0].expires_at_ms == 0);
+  CHECK(got[1].key == "expiring");
+  CHECK(got[1].expires_at_ms == 1700000000000);
+  CHECK(got[2].op == Record::Op::kDelete);
+  CHECK(got[2].expires_at_ms == 0);
+}
+
+TEST_CASE("a batch carries a different expiry per mutation") {
+  TempLog log("batch_expiry");
+  {
+    cachedb::Wal wal(log.path, SyncPolicy::kNo);
+    std::vector<Wal::Mutation> batch;
+    batch.push_back({Record::Op::kSet, "a", "1", 111});
+    batch.push_back({Record::Op::kSet, "b", "2", 0});
+    batch.push_back({Record::Op::kSet, "c", "3", 333});
+    CHECK(wal.append_batch(batch));
+  }
+
+  const auto got = drain(log.path);
+  REQUIRE(got.size() == 3);
+  CHECK(got[0].expires_at_ms == 111);
+  CHECK(got[1].expires_at_ms == 0);
+  CHECK(got[2].expires_at_ms == 333);
 }

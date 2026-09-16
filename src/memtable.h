@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
@@ -26,6 +27,16 @@ namespace cachedb
       // key may still exist in an older SSTable this table knows nothing
       // about, and the marker is the only thing that will hide it.
       bool tombstone = false;
+
+      // Wall-clock milliseconds at which this entry stops being visible, or 0
+      // for "never". PROJECT.md 6.8.
+      //
+      // Stored raw and never interpreted here. Deciding whether a stamp is in
+      // the past means knowing what "now" is, and letting three layers each
+      // ask the clock separately is how a key expires in the memtable but not
+      // in the SSTable it is hiding. Store owns that comparison, for itself
+      // and for the tables below it.
+      int64_t expires_at_ms = 0;
     };
 
     // Three answers, not two, and the distinction is the whole reason this
@@ -44,7 +55,12 @@ namespace cachedb
     // outlive the lookup that produced it.
     const Entry *find(std::string_view key) const;
 
-    void set(std::string_view key, std::string_view value);
+    // expires_at_ms = 0 means no expiry, and a plain SET passes 0 on purpose:
+    // real Redis drops an existing TTL when a key is overwritten without one,
+    // so carrying the old stamp forward would be the wrong behaviour rather
+    // than a conservative one.
+    void set(std::string_view key, std::string_view value,
+             int64_t expires_at_ms = 0);
 
     // Reports whether the key was live beforehand, which is DEL's reply count.
     bool del(std::string_view key);
@@ -65,6 +81,10 @@ namespace cachedb
     size_t entry_count() const { return entries_.size(); }
 
     // Live keys only, which is what a client asking for a key count means.
+    //
+    // Counts an expired entry that the sweep has not reached yet, because
+    // knowing otherwise would mean reading the clock here. It is a status
+    // line, not an answer a client acts on.
     size_t live_count() const { return live_count_; }
 
     // Approximate bytes held, used to decide when to flush. Accounts for

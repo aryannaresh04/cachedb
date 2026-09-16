@@ -175,8 +175,9 @@ TEST_CASE("the footer is what makes the file readable") {
   const std::string good = read_file(f.path);
 
   SUBCASE("magic identifies the format") {
-    // Last eight bytes, readable in a hex dump on purpose.
-    CHECK(good.compare(good.size() - 8, 8, "CDBSSTv1") == 0);
+    // Last eight bytes, readable in a hex dump on purpose. v2 since entries
+    // may carry an expiry; v1 is still accepted on read.
+    CHECK(good.compare(good.size() - 8, 8, "CDBSSTv2") == 0);
   }
 
   SUBCASE("a file without our magic is refused, not misparsed") {
@@ -224,4 +225,92 @@ TEST_CASE("the bloom filter is consulted before the disk") {
     if (!t.get("absent" + std::to_string(i)).found) ++absent;
   }
   CHECK(absent == 1000);  // no false positive may become a found key
+}
+
+TEST_CASE("an expiry survives the file") {
+  TempFile f("expiry");
+  {
+    SstableWriter w(f.path);
+    w.add("a", "1", false);                  // no expiry
+    w.add("b", "2", false, 1700000000000);   // expiring
+    w.add("c", "3", true);                   // tombstone
+    REQUIRE(w.finish());
+  }
+  const Sstable t(f.path);
+
+  const auto a = t.get("a");
+  CHECK(a.found);
+  CHECK(a.value == "1");
+  CHECK(a.expires_at_ms == 0);
+
+  const auto b = t.get("b");
+  CHECK(b.found);
+  CHECK(b.value == "2");
+  CHECK(b.expires_at_ms == 1700000000000);
+
+  const auto c = t.get("c");
+  CHECK(c.found);
+  CHECK(c.tombstone);
+  CHECK(c.expires_at_ms == 0);
+}
+
+TEST_CASE("a tombstone cannot be given an expiry") {
+  TempFile f("tomb_expiry");
+  {
+    SstableWriter w(f.path);
+    w.add("k", "", true, 5000);
+    REQUIRE(w.finish());
+  }
+  const auto got = Sstable(f.path).get("k");
+  CHECK(got.tombstone);
+  CHECK(got.expires_at_ms == 0);
+}
+
+TEST_CASE("a table with no expiries is a v1 file but for its last byte") {
+  // This is what makes "v2 reads v1" more than a hope. If a v2 table that
+  // uses no expiry were laid out differently from a v1 table, then accepting
+  // the v1 magic would be accepting files this reader cannot actually parse.
+  TempFile v2("compat_v2");
+  TempFile v1("compat_v1");
+  const std::map<std::string, std::pair<std::string, bool>> rows = {
+      {"a", {"1", false}}, {"b", {"2", false}}, {"gone", {"", true}}};
+  write_table(v2.path, rows);
+
+  std::string bytes = read_file(v2.path);
+  REQUIRE(bytes.size() > 8);
+  // Everything before the version byte must already be a valid v1 table.
+  bytes[bytes.size() - 1] = '1';
+  std::ofstream(v1.path, std::ios::binary | std::ios::trunc)
+      .write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+
+  const Sstable t(v1.path);
+  CHECK(t.entry_count() == 3);
+  CHECK(t.get("a").value == "1");
+  CHECK(t.get("b").value == "2");
+  CHECK(t.get("gone").tombstone);
+  CHECK_FALSE(t.get("missing").found);
+}
+
+TEST_CASE("an entry claiming an expiry it has no room for is not believed") {
+  // The flags byte is read from the file, so the bit can be set on an entry
+  // whose block ends before the eight bytes it promises. Reading the stamp
+  // before checking would run off the end of the block.
+  TempFile f("short_expiry");
+  {
+    SstableWriter w(f.path);
+    w.add("k", "v", false);
+    REQUIRE(w.finish());
+  }
+  std::string bytes = read_file(f.path);
+  // Entry starts at 0: [klen:4][vlen:4][flags:1]. Set the expiry bit on an
+  // entry that carries no stamp, so the claimed body runs past the data.
+  bytes[8] = static_cast<char>(0x02);
+  std::ofstream(f.path, std::ios::binary | std::ios::trunc)
+      .write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+
+  const Sstable t(f.path);
+  // The answer is "not here", which is a lie the layer above can survive --
+  // it keeps looking in an older table. What matters is that it neither
+  // crashes nor invents a key out of bytes past the end.
+  CHECK_FALSE(t.get("k").found);
 }

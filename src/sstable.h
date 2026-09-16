@@ -17,6 +17,7 @@ namespace cachedb
   //
   //   ┌──────────────────────────────────────────┐
   //   │ Data block   [klen:4][vlen:4][flags:1]   │  sorted by key
+  //   │              [expires_at_ms:8]?          │  only if flags bit 1
   //   │              [key][value] ...            │
   //   ├──────────────────────────────────────────┤
   //   │ Index block  [count:4] then, per entry,  │  sparse: roughly one
@@ -39,10 +40,26 @@ namespace cachedb
   namespace sstable
   {
 
-    // "CDBSSTv1" read straight out of a hex dump. A version lives in the last
-    // byte so a future format change is a diagnosable error rather than a
-    // misparse.
-    inline constexpr char kMagic[8] = {'C', 'D', 'B', 'S', 'S', 'T', 'v', '1'};
+    // "CDBSSTv2" read straight out of a hex dump. A version lives in the last
+    // byte so a format change is a diagnosable error rather than a misparse,
+    // and this is the change it was put there for: v2 entries may carry an
+    // expiry between the flags byte and the key (PROJECT.md 6.8).
+    //
+    // Both versions are read and only v2 is written. Those are two different
+    // compatibility directions and only one of them is free:
+    //
+    //   new reader, old file  -- safe on its own, since a v1 entry cannot
+    //                            have the expiry bit set. Accepting v1 means
+    //                            tables already on disk keep working instead
+    //                            of a format change costing a wipe.
+    //   old reader, new file  -- NOT safe, and this is what the bump buys. An
+    //                            older reader ignores a flag bit it does not
+    //                            know, so it would take the first eight bytes
+    //                            of the expiry as the start of the key and
+    //                            answer confidently with the wrong key. The
+    //                            version makes that a refusal instead.
+    inline constexpr char kMagic[8] = {'C', 'D', 'B', 'S', 'S', 'T', 'v', '2'};
+    inline constexpr char kMagicV1[8] = {'C', 'D', 'B', 'S', 'S', 'T', 'v', '1'};
     inline constexpr size_t kFooterSize = 32;
 
     // One index entry per this many bytes of data block, not per N keys. The
@@ -58,6 +75,10 @@ namespace cachedb
       std::string_view key;
       std::string_view value;
       bool tombstone = false;
+      // Wall-clock milliseconds, or 0 for never. Stored and not interpreted:
+      // Store owns the comparison against the clock, so that this table and
+      // the memtable above it cannot disagree about what time it is.
+      int64_t expires_at_ms = 0;
     };
 
   } // namespace sstable
@@ -81,7 +102,10 @@ namespace cachedb
     // Cannot fail on its own. A write error is remembered and reported by
     // finish(), so the caller has one place to check rather than a test after
     // every key.
-    void add(std::string_view key, std::string_view value, bool tombstone);
+    // A tombstone is never given an expiry, whatever is passed: an expiring
+    // tombstone is a deleted key that comes back.
+    void add(std::string_view key, std::string_view value, bool tombstone,
+             int64_t expires_at_ms = 0);
 
     // Writes the index, the filter and the footer, then fsyncs.
     //
@@ -137,6 +161,10 @@ namespace cachedb
       bool found = false;
       bool tombstone = false;
       std::string value;
+      // 0 for never. An expired entry is still reported found here -- whether
+      // that means absent is Store's call, and answering it here would mean
+      // this file reading a clock.
+      int64_t expires_at_ms = 0;
     };
 
     Lookup get(std::string_view key) const;
