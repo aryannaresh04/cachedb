@@ -36,6 +36,10 @@ FROM debian:bookworm-slim
 # cmake             build system
 # redis-tools       redis-cli and redis-benchmark -- these ARE the M1 and M4
 #                   acceptance tests, not conveniences
+# redis-server      real Redis, to benchmark against on this same machine.
+#                   PROJECT.md 10 wants identical workloads run side by side,
+#                   because a throughput number compared against someone
+#                   else's hardware means nothing at all
 # netcat-openbsd    raw inline-command testing, which PROJECT.md 6.2 calls out
 #                   as the reason inline commands are supported at all
 # procps            pgrep/ps for the M2 crash test
@@ -46,6 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       cmake \
       redis-tools \
+      redis-server \
       netcat-openbsd \
       procps \
  && rm -rf /var/lib/apt/lists/*

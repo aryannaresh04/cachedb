@@ -88,6 +88,8 @@ namespace cachedb
     // (6.3), and that estimate is deliberately a slight overestimate.
     size_t memtable_limit_bytes = 4u * 1024 * 1024;
     int bloom_bits_per_key = bloom::kDefaultBitsPerKey;
+    // Benchmark-only. See the note on Sstable's constructor.
+    bool use_bloom = true;
   };
 
   // The storage engine's front door: it owns durability, and the order the

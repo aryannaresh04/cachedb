@@ -122,7 +122,13 @@ namespace cachedb
   {
   public:
     // Throws if the file is missing, too short, or does not carry our magic.
-    explicit Sstable(const std::string &path);
+    //
+    // use_bloom exists for one reason: PROJECT.md 10 asks for read latency
+    // with the filter on against off, and there is no way to measure what a
+    // filter saves without being able to switch it off. Never false in normal
+    // operation -- skipping it costs a disk read per table per miss and buys
+    // nothing.
+    explicit Sstable(const std::string &path, bool use_bloom = true);
 
     // The same three answers as Memtable::find, for the same reason: absent
     // here means keep looking in an older file, a tombstone means stop.
@@ -150,6 +156,7 @@ namespace cachedb
     std::vector<IndexEntry> index_;
     uint64_t data_end_ = 0;
     size_t entry_count_ = 0;
+    bool use_bloom_ = true;
   };
 
 } // namespace cachedb

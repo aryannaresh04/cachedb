@@ -160,7 +160,8 @@ bool SstableWriter::finish() {
   return true;
 }
 
-Sstable::Sstable(const std::string& path) : path_(path) {
+Sstable::Sstable(const std::string& path, bool use_bloom)
+    : path_(path), use_bloom_(use_bloom) {
   fd_.reset(::open(path.c_str(), O_RDONLY));
   if (!fd_.valid()) throw_errno("open", path);
 
@@ -230,8 +231,10 @@ Sstable::Sstable(const std::string& path) : path_(path) {
 
 Sstable::Lookup Sstable::get(std::string_view key) const {
   // The filter first, because the whole point of it is to answer without
-  // touching the disk at all.
-  if (!bloom::may_contain(bloom_, key)) return {};
+  // touching the disk at all. Skipping it is a benchmark-only setting: the
+  // lookup below then reads a block from every table that could hold the key,
+  // which is precisely the cost the filter exists to avoid.
+  if (use_bloom_ && !bloom::may_contain(bloom_, key)) return {};
   if (index_.empty()) return {};
 
   // The last index entry whose key is <= the one we want. upper_bound finds

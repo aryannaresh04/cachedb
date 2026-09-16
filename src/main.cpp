@@ -21,7 +21,8 @@ constexpr const char* kDefaultDir = "data";
 void usage(const char* argv0) {
   std::fprintf(
       stderr,
-      "usage: %s [--port N] [--dir PATH] [--fsync always|everysec|no]\n",
+      "usage: %s [--port N] [--dir PATH] [--fsync always|everysec|no]\n"
+      "          [--memtable-limit BYTES] [--no-bloom]\n",
       argv0);
 }
 
@@ -46,6 +47,8 @@ int main(int argc, char** argv) {
   // PROJECT.md 6.4: the safe policy is the default. Losing writes should take
   // a deliberate flag, never an omission.
   cachedb::SyncPolicy policy = cachedb::SyncPolicy::kAlways;
+  size_t memtable_limit = cachedb::StoreOptions{}.memtable_limit_bytes;
+  bool use_bloom = true;
 
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -59,6 +62,25 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(argv[i], "--dir") == 0 && i + 1 < argc) {
       dir = argv[++i];
+      continue;
+    }
+    // Exposed for the benchmarks: varying it is how scripts/bench.sh controls
+    // the number of L0 tables a read has to walk, which is the whole point of
+    // the read-amplification measurement in PROJECT.md 10.
+    if (std::strcmp(argv[i], "--memtable-limit") == 0 && i + 1 < argc) {
+      const long long value = std::strtoll(argv[++i], nullptr, 10);
+      if (value <= 0) {
+        std::fprintf(stderr, "cachedb: memtable limit must be positive: %s\n",
+                     argv[i]);
+        return 1;
+      }
+      memtable_limit = static_cast<size_t>(value);
+      continue;
+    }
+    // Benchmarks only (PROJECT.md 10): there is no way to measure what the
+    // filter saves without being able to turn it off.
+    if (std::strcmp(argv[i], "--no-bloom") == 0) {
+      use_bloom = false;
       continue;
     }
     if (std::strcmp(argv[i], "--fsync") == 0 && i + 1 < argc) {
@@ -83,6 +105,8 @@ int main(int argc, char** argv) {
 
     cachedb::StoreOptions store_options;
     store_options.dir = dir;
+    store_options.memtable_limit_bytes = memtable_limit;
+    store_options.use_bloom = use_bloom;
     cachedb::Store store(store_options);
 
     // Recovery runs before the listener exists, so no client can read a state

@@ -53,7 +53,8 @@ Store::Store(StoreOptions options) : options_(std::move(options)) {
   // into a new file.
   std::sort(sequences.rbegin(), sequences.rend());
   for (const uint64_t seq : sequences) {
-    sstables_.push_back(std::make_unique<Sstable>(table_path(seq)));
+    sstables_.push_back(
+        std::make_unique<Sstable>(table_path(seq), options_.use_bloom));
   }
   if (!sequences.empty()) next_sequence_ = sequences.front() + 1;
 }
@@ -173,7 +174,8 @@ bool Store::flush() {
   // into the memtable and are flushed again, which is wasteful and harmless.
   if (wal_ && !wal_->truncate()) return false;
 
-  sstables_.insert(sstables_.begin(), std::make_unique<Sstable>(path));
+  sstables_.insert(sstables_.begin(),
+                   std::make_unique<Sstable>(path, options_.use_bloom));
   next_sequence_ = sequence + 1;
   memtable_.clear();
   return true;
