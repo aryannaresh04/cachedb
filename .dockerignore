@@ -1,0 +1,11 @@
+# The source is bind-mounted at run time, so nothing here is COPYed into the
+# image. This only keeps the build context small and the image build quick.
+.git/
+build*/
+data/
+bench/
+*.sst
+wal.log
+.DS_Store
+.cache/
+compile_commands.json
