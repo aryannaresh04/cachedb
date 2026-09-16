@@ -873,3 +873,40 @@ TEST_CASE("a stale merge temp file is cleaned up and never read") {
   REQUIRE(rebuilt.get("k").has_value());
   CHECK_FALSE(std::filesystem::exists(d.path + "/compact.tmp"));
 }
+
+TEST_CASE("a flush interrupted before its rename leaves no table behind") {
+  TempDir d;
+  {
+    Store store(opts(d));
+    CHECK(store.set("k", "v"));
+    CHECK(store.flush());
+  }
+  // What a kill -9 partway through writing the next table leaves: the flush
+  // assembles under this name and only a complete, fsynced table is ever
+  // renamed to NNNNNN.sst. Before that was so, the same crash left a
+  // half-written 000002.sst, and the reader refused to start on it.
+  std::ofstream(d.path + "/flush.tmp", std::ios::binary) << "half-writ";
+
+  StoreOptions o = opts(d);
+  Store rebuilt(o);
+  CHECK(rebuilt.sstable_count() == 1);  // the temp file is not a table
+  REQUIRE(rebuilt.get("k").has_value());
+  CHECK(rebuilt.get("k")->get() == "v");
+  CHECK_FALSE(std::filesystem::exists(d.path + "/flush.tmp"));
+
+  // And the next flush takes the name the interrupted one would have had,
+  // rather than skipping a sequence number because of it.
+  CHECK(rebuilt.set("k2", "v2"));
+  CHECK(rebuilt.flush());
+  CHECK(std::filesystem::exists(d.path + "/000002.sst"));
+  CHECK_FALSE(std::filesystem::exists(d.path + "/flush.tmp"));
+}
+
+TEST_CASE("a completed flush never leaves its temp file on disk") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("a", "1"));
+  CHECK(store.flush());
+  CHECK(std::filesystem::exists(d.path + "/000001.sst"));
+  CHECK_FALSE(std::filesystem::exists(d.path + "/flush.tmp"));
+}
