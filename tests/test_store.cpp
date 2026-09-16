@@ -635,3 +635,102 @@ TEST_CASE("a swept memtable survives a restart as the same absent keys") {
   CHECK_FALSE(rebuilt.get("gone").has_value());
   CHECK(rebuilt.get("staying").has_value());
 }
+
+namespace {
+
+size_t count_tables(const std::string& dir) {
+  size_t n = 0;
+  for (const auto& e : std::filesystem::directory_iterator(dir)) {
+    if (e.path().extension() == ".sst") ++n;
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("flush_all removes the tables, the log and the memtable") {
+  TempDir d;
+  TempLog log("flushall");
+  Wal wal(log.path, SyncPolicy::kNo);
+  StoreOptions o = opts(d);
+  Store store(o);
+  store.set_wal(&wal);
+
+  CHECK(store.set("a", "1"));
+  CHECK(store.flush());
+  CHECK(store.set("b", "2"));
+  CHECK(store.flush());
+  CHECK(store.set("c", "3"));  // still in the memtable
+  REQUIRE(count_tables(d.path) == 2);
+  REQUIRE(store.sstable_count() == 2);
+
+  CHECK(store.flush_all());
+
+  CHECK(count_tables(d.path) == 0);  // the files are gone, not just forgotten
+  CHECK(store.sstable_count() == 0);
+  CHECK(store.memtable_keys() == 0);
+  CHECK(wal.size() == 0);
+  CHECK_FALSE(store.get("a").has_value());
+  CHECK_FALSE(store.get("b").has_value());
+  CHECK_FALSE(store.get("c").has_value());
+}
+
+TEST_CASE("a store is usable again straight after flush_all") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("old", "v"));
+  CHECK(store.flush());
+  CHECK(store.flush_all());
+
+  CHECK(store.set("new", "v"));
+  CHECK(store.flush());
+  // Numbering restarts, which is safe precisely because every table that
+  // could have claimed a number was removed durably first.
+  CHECK(count_tables(d.path) == 1);
+  REQUIRE(store.get("new").has_value());
+  CHECK(store.get("new")->get() == "v");
+  CHECK_FALSE(store.get("old").has_value());
+}
+
+TEST_CASE("flush_all on an empty store succeeds and changes nothing") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.flush_all());
+  CHECK(store.sstable_count() == 0);
+  CHECK(count_tables(d.path) == 0);
+}
+
+TEST_CASE("nothing comes back after flush_all and a restart") {
+  TempDir d;
+  TempLog log("flushall_restart");
+  {
+    Wal wal(log.path, SyncPolicy::kNo);
+    StoreOptions o = opts(d);
+    Store store(o);
+    store.set_wal(&wal);
+    CHECK(store.set("a", "1"));
+    CHECK(store.flush());
+    CHECK(store.set("b", "2"));
+    CHECK(store.flush_all());
+  }
+
+  StoreOptions o = opts(d);
+  Store rebuilt(o);  // adopts whatever tables remain
+  replay(log.path, [&](const Record& rec) { rebuilt.apply(rec); });
+  CHECK(rebuilt.sstable_count() == 0);
+  CHECK_FALSE(rebuilt.get("a").has_value());
+  CHECK_FALSE(rebuilt.get("b").has_value());
+}
+
+TEST_CASE("the sweep counter INFO reports accumulates") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.swept_keys() == 0);
+  CHECK(store.set("a", "v", cachedb::now_ms() - 1000));
+  CHECK(store.set("b", "v", cachedb::now_ms() - 1000));
+  CHECK(store.sweep_expired(100) == 2);
+  CHECK(store.swept_keys() == 2);
+  // A second sweep finds nothing left and the total does not move.
+  CHECK(store.sweep_expired(100) == 0);
+  CHECK(store.swept_keys() == 2);
+}

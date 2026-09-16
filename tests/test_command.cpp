@@ -87,7 +87,10 @@ TEST_CASE("errors that leave the connection usable") {
   Store s;
 
   SUBCASE("unknown command") {
-    CHECK(run(s, {"FLUSHALL"}) == "-ERR unknown command 'FLUSHALL'\r\n");
+    // SUBSCRIBE is a real Redis command and an explicit non-goal here
+    // (section 2), so it will stay unknown rather than quietly becoming
+    // implemented the way FLUSHALL did to the version of this test.
+    CHECK(run(s, {"SUBSCRIBE"}) == "-ERR unknown command 'SUBSCRIBE'\r\n");
   }
 
   SUBCASE("a name too long to be any command") {
@@ -282,5 +285,147 @@ TEST_CASE("EXPIRE and TTL") {
           "-ERR wrong number of arguments for 'ttl' command\r\n");
     CHECK(run(s, {"TTL", "a", "b"}) ==
           "-ERR wrong number of arguments for 'ttl' command\r\n");
+  }
+}
+
+TEST_CASE("INCR") {
+  Store s;
+
+  SUBCASE("a missing key counts as zero") {
+    CHECK(run(s, {"INCR", "c"}) == ":1\r\n");
+    CHECK(run(s, {"INCR", "c"}) == ":2\r\n");
+    // Stored as decimal text, so GET sees what a client would expect.
+    CHECK(run(s, {"GET", "c"}) == "$1\r\n2\r\n");
+  }
+
+  SUBCASE("an existing number is incremented") {
+    CHECK(run(s, {"SET", "n", "41"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "n"}) == ":42\r\n");
+    CHECK(run(s, {"SET", "neg", "-5"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "neg"}) == ":-4\r\n");
+  }
+
+  SUBCASE("a value that is not a number is refused") {
+    CHECK(run(s, {"SET", "s", "hello"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "s"}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    CHECK(run(s, {"SET", "e", ""}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "e"}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    CHECK(run(s, {"SET", "f", "3.5"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "f"}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    // The value is left exactly as it was.
+    CHECK(run(s, {"GET", "s"}) == "$5\r\nhello\r\n");
+  }
+
+  SUBCASE("only the canonical spelling of a number counts") {
+    // Checked against a real redis-server, which refuses all three. An
+    // integer it stores has to read back as the bytes it came from, and
+    // "007" and "7" would be one number with two spellings.
+    CHECK(run(s, {"SET", "z", "007"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "z"}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    CHECK(run(s, {"SET", "p", "+5"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "p"}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    CHECK(run(s, {"SET", "m", "-0"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "m"}) ==
+          "-ERR value is not an integer or out of range\r\n");
+    // Plain zero is still a number, and is the one that may begin with 0.
+    CHECK(run(s, {"SET", "zero", "0"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "zero"}) == ":1\r\n");
+  }
+
+  SUBCASE("incrementing past the top of the range is refused, not wrapped") {
+    CHECK(run(s, {"SET", "big", "9223372036854775807"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "big"}) ==
+          "-ERR increment or decrement would overflow\r\n");
+    CHECK(run(s, {"GET", "big"}) == "$19\r\n9223372036854775807\r\n");
+  }
+
+  SUBCASE("an existing TTL survives the increment") {
+    // A plain SET drops a TTL and INCR is a SET underneath, so without
+    // carrying the stamp across, a counter would quietly lose its lifetime
+    // and a key meant to disappear would live for ever because something
+    // counted it.
+    CHECK(run(s, {"SET", "t", "1", "EX", "100"}) == "+OK\r\n");
+    CHECK(run(s, {"INCR", "t"}) == ":2\r\n");
+    CHECK(run(s, {"TTL", "t"}) == ":100\r\n");
+  }
+
+  SUBCASE("an expired counter starts again from zero") {
+    CHECK(run(s, {"SET", "t", "41"}) == "+OK\r\n");
+    CHECK(run(s, {"EXPIRE", "t", "-1"}) == ":1\r\n");
+    // lookup() reports it absent, so INCR treats it as a missing key.
+    CHECK(run(s, {"INCR", "t"}) == ":1\r\n");
+    CHECK(run(s, {"TTL", "t"}) == ":-1\r\n");
+  }
+
+  SUBCASE("arity is checked") {
+    CHECK(run(s, {"INCR"}) ==
+          "-ERR wrong number of arguments for 'incr' command\r\n");
+    CHECK(run(s, {"INCR", "a", "b"}) ==
+          "-ERR wrong number of arguments for 'incr' command\r\n");
+  }
+}
+
+TEST_CASE("FLUSHALL, INFO and CONFIG") {
+  Store s;
+
+  SUBCASE("FLUSHALL empties the store") {
+    CHECK(run(s, {"SET", "a", "1"}) == "+OK\r\n");
+    CHECK(run(s, {"SET", "b", "2"}) == "+OK\r\n");
+    CHECK(run(s, {"FLUSHALL"}) == "+OK\r\n");
+    CHECK(run(s, {"GET", "a"}) == "$-1\r\n");
+    CHECK(run(s, {"EXISTS", "a", "b"}) == ":0\r\n");
+  }
+
+  SUBCASE("INFO is a bulk string of sections and fields") {
+    CHECK(run(s, {"SET", "k", "v"}) == "+OK\r\n");
+    const std::string info = run(s, {"INFO"});
+    CHECK(info.rfind("$", 0) == 0);  // a bulk string, not a simple one
+    for (const char* needle :
+         {"# Server", "# Memtable", "# Persistence", "# Expiry",
+          "uptime_in_seconds:", "memtable_keys:1", "memtable_bytes:",
+          "memtable_limit_bytes:", "sstable_count:0", "wal_bytes:",
+          "wal_fsyncs:", "flush_failed:0", "expired_keys_swept:0"}) {
+      CAPTURE(needle);
+      CHECK(info.find(needle) != std::string::npos);
+    }
+  }
+
+  SUBCASE("INFO reports no log when there is none") {
+    // The unit tests run without a Wal, and a status line has to be able to
+    // say so rather than report a policy it does not have.
+    CHECK(run(s, {"INFO"}).find("wal_fsync_policy:none") != std::string::npos);
+  }
+
+  SUBCASE("INFO counts what the sweep reclaimed") {
+    CHECK(run(s, {"SET", "k", "v"}) == "+OK\r\n");
+    CHECK(run(s, {"EXPIRE", "k", "-1"}) == ":1\r\n");
+    s.sweep_expired(100);
+    CHECK(run(s, {"INFO"}).find("expired_keys_swept:1") != std::string::npos);
+  }
+
+  SUBCASE("CONFIG GET answers with a pair, which is what clients require") {
+    // An empty array was the first attempt and redis-benchmark still printed
+    // "WARNING: Could not fetch server CONFIG" -- it wants the shape, not
+    // merely a reply.
+    CHECK(run(s, {"CONFIG", "GET", "appendonly"}) ==
+          "*2\r\n$10\r\nappendonly\r\n$3\r\nyes\r\n");
+    CHECK(run(s, {"CONFIG", "GET", "save"}) ==
+          "*2\r\n$4\r\nsave\r\n$0\r\n\r\n");
+    CHECK(run(s, {"CONFIG", "GET", "maxmemory"}) ==
+          "*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n");
+  }
+
+  SUBCASE("CONFIG GET of something we do not have is an empty array") {
+    CHECK(run(s, {"CONFIG", "GET", "nonsense"}) == "*0\r\n");
+  }
+
+  SUBCASE("CONFIG SET is refused rather than silently accepted") {
+    const std::string reply = run(s, {"CONFIG", "SET", "maxmemory", "100"});
+    CHECK(reply.rfind("-ERR Unknown CONFIG subcommand", 0) == 0);
   }
 }

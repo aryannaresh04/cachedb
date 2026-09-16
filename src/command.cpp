@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <functional>
 #include <map>
 #include <string_view>
@@ -57,20 +58,32 @@ void append_printable(std::string& out, std::string_view s) {
 constexpr const char* kNotAnInteger =
     "ERR value is not an integer or out of range";
 
-// Strict on purpose: strtoll would accept "10abc" and leading whitespace, and
-// a client that sent either has a bug it should be told about rather than a
-// timeout it has to guess at. No locale, no partial parse, and the overflow
-// check happens before the multiply rather than after it -- signed overflow
-// is undefined behaviour, so detecting it afterwards is detecting nothing.
+// Strict on purpose, and strict in the same way Redis is.
+//
+// strtoll would accept "10abc", leading whitespace and a locale's idea of
+// digits; a client that sent any of those has a bug it should be told about
+// rather than a silently different number. No partial parse, and the overflow
+// check happens before the multiply rather than after it -- signed overflow is
+// undefined behaviour, so detecting it afterwards is detecting nothing.
+//
+// It also demands the *canonical* spelling: no leading zeros, no leading '+',
+// and no "-0". That is not fussiness copied for its own sake. Redis's
+// string2ll requires a number to round-trip to exactly the bytes it came from,
+// because an integer it stores has to read back identical; "007" and "7" would
+// be the same number and different values. Checked against a real server,
+// which rejects 007 for INCR, for SET's EX and for EXPIRE alike -- so this
+// lives in the parser rather than in one command.
 bool parse_int64(std::string_view text, int64_t* out) {
   if (text.empty() || text.size() > 20) return false;
   size_t i = 0;
   bool negative = false;
-  if (text[0] == '-' || text[0] == '+') {
-    negative = text[0] == '-';
+  if (text[0] == '-') {
+    negative = true;
     i = 1;
     if (text.size() == 1) return false;
   }
+  // "0" is the one number that may start with a zero, and only alone.
+  if (text[i] == '0' && (text.size() - i > 1 || negative)) return false;
 
   int64_t value = 0;
   constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
@@ -253,6 +266,161 @@ void cmd_ttl(const Command& c, Store& store, std::string& out) {
   append_integer(out, (r.remaining_ms + 999) / 1000);
 }
 
+void cmd_incr(const Command& c, Store& store, std::string& out) {
+  // A missing key counts as 0, so INCR on nothing replies :1. Redis's rule,
+  // and the reason this is one command rather than a GET and a SET.
+  int64_t value = 0;
+  int64_t expires_at_ms = 0;
+
+  if (const std::optional<Found> found = store.lookup(c.args[1])) {
+    // Parsed out before anything is written. The view borrows the memtable's
+    // own string on a hit, and set() assigns over that same string -- holding
+    // the view across the write is the trap EXPIRE has to copy around. Here
+    // the bytes become an integer first, so there is nothing left to dangle.
+    if (!parse_int64(found->value.get(), &value)) {
+      append_error(out, kNotAnInteger);
+      return;
+    }
+    expires_at_ms = found->expires_at_ms;
+  }
+
+  if (value == std::numeric_limits<int64_t>::max()) {
+    append_error(out, "ERR increment or decrement would overflow");
+    return;
+  }
+  ++value;
+
+  // The expiry is carried across deliberately. A plain SET drops a TTL, and
+  // INCR is a SET underneath, so without this an incremented counter would
+  // quietly lose its lifetime -- and a key that was supposed to disappear
+  // would live for ever because something counted it.
+  if (!store.set(c.args[1], std::to_string(value), expires_at_ms)) {
+    append_error(out, "ERR the write could not be logged and was not applied");
+    return;
+  }
+  append_integer(out, value);
+}
+
+void cmd_flushall(const Command&, Store& store, std::string& out) {
+  if (!store.flush_all()) {
+    append_error(out, "ERR the flush could not be completed");
+    return;
+  }
+  append_simple_string(out, "OK");
+}
+
+// Captured at static-init time, so it really is when the process started
+// rather than when something first asked. Calling a function during static
+// initialisation is safe; it is cross-TU *objects* that have no defined order.
+const int64_t kStartedMs = now_ms();
+
+const char* policy_name(SyncPolicy policy) {
+  switch (policy) {
+    case SyncPolicy::kAlways: return "always";
+    case SyncPolicy::kEverySec: return "everysec";
+    case SyncPolicy::kNo: return "no";
+  }
+  return "unknown";
+}
+
+void cmd_info(const Command&, Store& store, std::string& out) {
+  // Redis's shape: "# Section" lines and "field:value" lines, CRLF separated,
+  // the whole thing returned as one bulk string. Sections are what a client
+  // splits on, so the names matter more than the order.
+  std::string info;
+  const auto line = [&info](const char* key, unsigned long long value) {
+    info += key;
+    info += ':';
+    info += std::to_string(value);
+    info += "\r\n";
+  };
+
+  info += "# Server\r\n";
+  line("uptime_in_seconds",
+       static_cast<unsigned long long>((now_ms() - kStartedMs) / 1000));
+
+  info += "\r\n# Memtable\r\n";
+  // Keys in the memtable only. A true total would mean merging every level,
+  // which is what a compaction does and not what a status line should.
+  line("memtable_keys", store.memtable_keys());
+  line("memtable_bytes", store.memtable_bytes());
+  line("memtable_limit_bytes", store.memtable_limit_bytes());
+
+  info += "\r\n# Persistence\r\n";
+  line("sstable_count", store.sstable_count());
+  line("wal_bytes", store.wal_bytes());
+  // The one number that makes the fsync policies distinguishable from
+  // outside the process. It took strace to see this difference the first
+  // time; a skipped-sync optimisation is exactly what silently stops working.
+  line("wal_fsyncs", store.wal_syncs());
+  info += "wal_fsync_policy:";
+  info += store.has_wal() ? policy_name(store.wal_policy()) : "none";
+  info += "\r\n";
+  // Writes are still durable when this is 1 -- they are in the log. What has
+  // stopped is the memtable being able to shed them.
+  line("flush_failed", store.flush_failed() ? 1 : 0);
+
+  info += "\r\n# Expiry\r\n";
+  // The active sweep is invisible otherwise: its whole job is making keys
+  // disappear that were already unreachable.
+  line("expired_keys_swept", store.swept_keys());
+
+  append_bulk_string(out, info);
+}
+
+void cmd_config(const Command& c, Store& store, std::string& out) {
+  char buf[kMaxNameLen];
+  std::string_view sub;
+  if (normalize_name(c.args[1], buf, sub) && sub == "get") {
+    // redis-benchmark asks for `save` and `appendonly` before it starts and
+    // prints "WARNING: Could not fetch server CONFIG" unless it gets a
+    // two-element array back. An empty array was the first attempt and did
+    // not satisfy it -- the warning is about the shape of the reply, not
+    // about whether any parameter is configurable.
+    //
+    // Nothing here is invented to please the client. Each answer is a fact
+    // about this server stated in Redis's vocabulary: cachedb never
+    // snapshots, every write really does go to an append-only log, and that
+    // log's fsync policy is the one --fsync selected.
+    if (c.args.size() != 3) {
+      append_array_header(out, 0);
+      return;
+    }
+    char pbuf[kMaxNameLen];
+    std::string_view param;
+    std::string_view value;
+    bool known = false;
+    if (normalize_name(c.args[2], pbuf, param)) {
+      if (param == "save") {
+        value = "";  // no RDB-style snapshots, and none planned
+        known = true;
+      } else if (param == "appendonly") {
+        value = "yes";  // the WAL, which is not optional
+        known = true;
+      } else if (param == "appendfsync") {
+        value = store.has_wal() ? policy_name(store.wal_policy()) : "no";
+        known = true;
+      } else if (param == "maxmemory") {
+        value = "0";  // unbounded; the memtable limit is not a memory cap
+        known = true;
+      }
+    }
+    if (!known) {
+      append_array_header(out, 0);
+      return;
+    }
+    append_array_header(out, 2);
+    append_bulk_string(out, c.args[2]);
+    append_bulk_string(out, value);
+    return;
+  }
+  std::string msg = "ERR Unknown CONFIG subcommand or wrong number of ";
+  msg += "arguments for '";
+  append_printable(msg, c.args[1]);
+  msg += '\'';
+  append_error(out, msg);
+}
+
 void cmd_command(const Command&, Store&, std::string& out) {
   // redis-cli sends COMMAND DOCS on connect and waits for an answer before
   // showing a prompt. An empty array is a truthful "no command table to
@@ -273,6 +441,10 @@ const std::map<std::string, Spec, std::less<>>& dispatch_table() {
       {"get", {cmd_get, 2, 2}},
       {"expire", {cmd_expire, 3, 3}},
       {"ttl", {cmd_ttl, 2, 2}},
+      {"incr", {cmd_incr, 2, 2}},
+      {"flushall", {cmd_flushall, 1, -1}},
+      {"info", {cmd_info, 1, 2}},
+      {"config", {cmd_config, 2, -1}},
       {"del", {cmd_del, 2, -1}},
       {"exists", {cmd_exists, 2, -1}},
       {"command", {cmd_command, 1, -1}},

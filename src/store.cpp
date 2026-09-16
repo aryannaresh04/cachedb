@@ -1,6 +1,8 @@
 #include "store.h"
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -29,6 +31,37 @@ std::optional<uint64_t> sequence_of(const std::string& name) {
     if (c < '0' || c > '9') return std::nullopt;
   }
   return std::strtoull(digits.c_str(), nullptr, 10);
+}
+
+// Makes a directory's own contents durable -- the names in it, not the data
+// in the files it lists.
+//
+// Creating or removing a file changes the directory, and fsync(2) is explicit
+// that fsyncing the file does not carry that change with it: "Calling fsync()
+// does not necessarily ensure that the entry in the directory containing the
+// file has also reached disk. For that an explicit fsync() on a file
+// descriptor for the directory is also needed."
+//
+// Without this a flush could fsync a whole SSTable, truncate the log, and
+// lose the table to a power cut anyway, because the name pointing at it never
+// landed -- acknowledged writes gone, with the log already emptied on the
+// strength of a file that is no longer reachable. crash_test.sh cannot see
+// this: kill -9 leaves the page cache with the kernel, so the entry survives.
+// Only losing power loses it, which is exactly the distinction 6.4 draws.
+bool fsync_dir(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd < 0) return false;
+  bool ok = true;
+  for (;;) {
+    if (::fsync(fd) == 0) break;
+    if (errno == EINTR) continue;
+    // Same rule as the log's fsync: a writeback error is reported once and
+    // then cleared, so retrying could return success over lost data.
+    ok = false;
+    break;
+  }
+  ::close(fd);
+  return ok;
 }
 
 }  // namespace
@@ -226,7 +259,39 @@ size_t Store::sweep_expired(size_t budget) {
   // No maybe_flush() afterwards: sweeping never grows the memtable, and the
   // estimate does not fall when an entry is swept -- the allocator keeps the
   // freed bytes, so the process still holds them.
-  return memtable_.sweep_expired(now_ms(), budget);
+  const size_t swept = memtable_.sweep_expired(now_ms(), budget);
+  swept_keys_ += swept;
+  return swept;
+}
+
+bool Store::flush_all() {
+  // Closed before they are unlinked. On Linux unlinking an open file is legal
+  // and the space is only reclaimed when the last descriptor goes, so leaving
+  // these open would delete the names and keep the bytes.
+  std::vector<std::string> paths;
+  paths.reserve(sstables_.size());
+  for (const auto& table : sstables_) paths.push_back(table->path());
+  sstables_.clear();
+
+  bool ok = true;
+  for (const std::string& path : paths) {
+    // ENOENT is not a failure: the file is gone, which is the goal.
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) ok = false;
+  }
+
+  // The unlinks have to be durable before the log is cut. See the note on
+  // this function in store.h for what the other order costs.
+  if (!options_.dir.empty() && !fsync_dir(options_.dir)) ok = false;
+  if (!ok) return false;
+
+  if (wal_ && !wal_->truncate()) return false;
+
+  memtable_.clear();
+  // Safe to start over: every table that could have claimed a number is gone,
+  // and gone durably, so no name can collide with one a restart would find.
+  next_sequence_ = 1;
+  flush_failed_ = false;
+  return true;
 }
 
 void Store::maybe_flush() {
@@ -259,8 +324,14 @@ bool Store::flush() {
     if (!writer.finish()) return false;
   }
 
-  // The table is fsynced, so the data exists in two places. Only now may the
-  // log be cut. Truncating first would leave a window where a crash loses
+  // The table's bytes are fsynced, but the directory entry naming it is not
+  // durable until the directory itself is synced -- see fsync_dir above. This
+  // has to happen before the log is cut, or a power cut could take the name
+  // away from a log that has already been emptied.
+  if (!options_.dir.empty() && !fsync_dir(options_.dir)) return false;
+
+  // The table is fsynced and reachable, so the data exists in two places.
+  // Only now may the log be cut. Truncating first would leave a window where a crash loses
   // everything the memtable held; doing it in this order, a crash between the
   // two simply replays records that are already in the table -- they go back
   // into the memtable and are flushed again, which is wasteful and harmless.

@@ -211,6 +211,37 @@ namespace cachedb
     // reason -- its lazy deletes are real deletes.
     size_t sweep_expired(size_t budget);
 
+    // Removes everything: the memtable, every SSTable, and the log.
+    //
+    // The order is a durability question rather than a tidy-up. The tables go
+    // first and their removal is made durable before the log is cut, because
+    // the other order has a specific failure: truncate the log, lose power
+    // before the unlinks land, and the tables come back holding values that
+    // newer writes had replaced -- writes which were acknowledged and which
+    // the log no longer holds. An old value resurfacing is worse than a
+    // FLUSHALL that did not happen, and a FLUSHALL that did not happen is all
+    // the client can conclude, since it never got its reply.
+    [[nodiscard]] bool flush_all();
+
+    // Expired entries the active sweep has reclaimed since startup. Reported
+    // by INFO, because the sweep is otherwise invisible from outside: its
+    // whole job is to make keys disappear that were already unreachable.
+    uint64_t swept_keys() const { return swept_keys_; }
+
+    size_t memtable_bytes() const { return memtable_.bytes(); }
+    size_t memtable_limit_bytes() const {
+      return options_.memtable_limit_bytes;
+    }
+
+    // Borrowed, so these answer 0 when there is no log at all -- which is
+    // what the unit tests run with.
+    uint64_t wal_bytes() const { return wal_ ? wal_->size() : 0; }
+    uint64_t wal_syncs() const { return wal_ ? wal_->syncs() : 0; }
+    bool has_wal() const { return wal_ != nullptr; }
+    SyncPolicy wal_policy() const {
+      return wal_ ? wal_->policy() : SyncPolicy::kNo;
+    }
+
     // Writes the memtable out as a new SSTable and truncates the log. Normally
     // driven by the threshold; exposed so a test does not have to write four
     // megabytes to see one happen.
@@ -245,6 +276,7 @@ namespace cachedb
     std::vector<std::unique_ptr<Sstable>> sstables_;
     StoreOptions options_;
     uint64_t next_sequence_ = 1;
+    uint64_t swept_keys_ = 0;
     bool flush_failed_ = false;
     Wal *wal_ = nullptr;
   };
