@@ -28,9 +28,27 @@
 # by cutting a few bytes off the log after the kill, which is the state a power
 # cut would leave, and then checks recovery keeps everything before the damage.
 #
+# The memtable limit is set small so flushes happen under the kill. At the
+# 4 MB default 10,000 keys never fill the memtable, so every run recovered
+# from the log alone and the flush path was never in the picture. Now each run
+# leaves several tables plus a log that was truncated mid-run, and the
+# acknowledged keys have to come back from both -- which also runs compaction
+# and the restart's table adoption under a kill.
+#
+# What this still cannot do, honestly: land the kill *inside* a flush. A flush
+# of ~500 keys takes well under a millisecond, so a random kill essentially
+# never catches one -- the same limit that keeps phase 1 from tearing a record.
+# That is how a flush that wrote straight to NNNNNN.sst went unnoticed: a kill
+# mid-flush would have left a half-written table under a name the reader
+# trusts and the restart would have refused. A flush now lands as flush.tmp
+# until complete, and the file it leaves is covered by a unit test in
+# test_store.cpp rather than by luck here. Runs whose kill did land in a flush
+# are counted below so that if one ever does, it is visible.
+#
 #   ./scripts/crash_test.sh                 10 runs, 10k keys, fsync=always
 #   RUNS=3 KEYS=2000 ./scripts/crash_test.sh
 #   FSYNC=everysec ./scripts/crash_test.sh  expected to still pass: see above
+#   MEMTABLE_LIMIT=4194304 ./scripts/crash_test.sh   the M2 shape, no flushes
 #
 # Linux only, and it needs a built server -- run it inside the container.
 
@@ -41,6 +59,9 @@ KEYS=${KEYS:-10000}
 PORT=${PORT:-7379}
 FSYNC=${FSYNC:-always}
 TEAR_RUNS=${TEAR_RUNS:-3}
+# 64 KB is roughly 500 of these keys per flush, so a run flushes dozens of
+# times and the kill has every chance of landing inside one.
+MEMTABLE_LIMIT=${MEMTABLE_LIMIT:-65536}
 BIN=${BIN:-./build-linux/cachedb}
 
 if [ ! -x "$BIN" ]; then
@@ -72,7 +93,8 @@ wait_ready() {
 }
 
 start_server() {  # $1 = data dir, $2 = log file
-  "$BIN" --dir "$1" --fsync "$FSYNC" --port "$PORT" > "$2" 2>&1 &
+  "$BIN" --dir "$1" --fsync "$FSYNC" --port "$PORT" \
+    --memtable-limit "$MEMTABLE_LIMIT" > "$2" 2>&1 &
   SERVER_PID=$!
   wait_ready
 }
@@ -120,8 +142,17 @@ check_keys() {  # $1 = how many
   diff -q "$WORK/want.txt" "$WORK/got.txt" > /dev/null 2>&1
 }
 
-torn=0   # runs in which recovery actually had to discard a partial record
+torn=0      # runs in which recovery actually had to discard a partial record
+midflush=0  # runs in which the kill landed inside a flush
 fails=0
+
+# How many tables the run left, and whether the kill caught a flush in
+# progress -- which is exactly the file a restart must ignore.
+inspect_dir() {
+  tables=$(ls "$dir"/*.sst 2> /dev/null | wc -l)
+  if [ -e "$dir/flush.tmp" ]; then midflush=$((midflush + 1)); return 0; fi
+  return 1
+}
 
 echo "phase 1: kill -9 mid-write, every acknowledged key must survive"
 for run in $(seq 1 "$RUNS"); do
@@ -130,16 +161,18 @@ for run in $(seq 1 "$RUNS"); do
   if ! run_to_crash; then
     echo "run $run: FAIL"; fails=$((fails + 1)); rm -rf "$WORK"; WORK=""; continue
   fi
+  inspect_dir && caught=" (killed mid-flush)" || caught=""
 
   if ! start_server "$dir" "$WORK/second.log"; then
-    echo "run $run: FAIL -- server did not restart after the kill"
+    echo "run $run: FAIL -- server did not restart after the kill$caught"
     cat "$WORK/second.log"
     fails=$((fails + 1)); rm -rf "$WORK"; WORK=""; continue
   fi
   grep -q 'discarded an incomplete tail' "$WORK/second.log" && torn=$((torn + 1))
 
   if check_keys "$acked"; then
-    printf 'run %2d: PASS  %6d acknowledged, all recovered\n' "$run" "$acked"
+    printf 'run %2d: PASS  %6d acknowledged, all recovered, %2d tables%s\n' \
+      "$run" "$acked" "$tables" "$caught"
   else
     lost=$(diff "$WORK/want.txt" "$WORK/got.txt" | grep -c '^<')
     echo "run $run: FAIL -- $lost of $acked acknowledged keys are missing or wrong"
@@ -154,6 +187,7 @@ done
 echo
 echo "phase 2: a torn record, as a power cut would leave it"
 tear_fails=0
+tear_skips=0
 for run in $(seq 1 "$TEAR_RUNS"); do
   WORK=$(mktemp -d)
 
@@ -165,6 +199,12 @@ for run in $(seq 1 "$TEAR_RUNS"); do
   # and nothing before it, so recovery must keep every key but the last.
   before=$(stat -c%s "$dir/wal.log")
   cut=$((RANDOM % 19 + 1))
+  # A flush truncates the log, so the kill can land on one holding less than
+  # a record. Nothing can be torn off that; the run is unusable, not a failure.
+  if [ "$before" -le "$cut" ]; then
+    echo "tear $run: SKIP -- log held only $before bytes at the kill, nothing to tear"
+    tear_skips=$((tear_skips + 1)); rm -rf "$WORK"; WORK=""; continue
+  fi
   truncate -s $((before - cut)) "$dir/wal.log"
 
   if ! start_server "$dir" "$WORK/second.log"; then
@@ -194,9 +234,14 @@ fails=$((fails + tear_fails))
 echo
 echo "fsync=$FSYNC, up to $KEYS keys per run"
 echo "phase 1: $((RUNS - (fails - tear_fails)))/$RUNS passed"
-echo "phase 2: $((TEAR_RUNS - tear_fails))/$TEAR_RUNS passed"
+echo "phase 2: $((TEAR_RUNS - tear_fails - tear_skips))/$((TEAR_RUNS - tear_skips)) passed, $tear_skips skipped"
 if [ "$torn" -eq 0 ]; then
   # Expected, and the reason phase 2 exists. See the header.
   echo "note: no phase 1 run tore a record on its own -- kill -9 cannot"
+fi
+if [ "$midflush" -eq 0 ]; then
+  echo "note: no kill landed inside a flush -- expected, see the header"
+else
+  echo "kills that landed inside a flush: $midflush, each restarted cleanly"
 fi
 [ "$fails" -eq 0 ] || exit 1
