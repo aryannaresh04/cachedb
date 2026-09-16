@@ -3,7 +3,12 @@
 
 #include "wal.h"
 
+#include <unistd.h>
+
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <vector>
 
 using cachedb::crc32;
 using cachedb::decode_record;
@@ -11,6 +16,59 @@ using cachedb::DecodeStatus;
 using cachedb::encode_record;
 using cachedb::kRecordHeaderSize;
 using cachedb::Record;
+using cachedb::replay;
+using cachedb::ReplayResult;
+using cachedb::SyncPolicy;
+using cachedb::Wal;
+
+namespace {
+
+// Each test gets its own log in the test binary's working directory, which is
+// under build*/ and therefore gitignored, and removes it on the way out
+// whether the test passed or not.
+struct TempLog {
+  std::string path;
+  explicit TempLog(const std::string& name) : path("wal_test_" + name + ".log") {
+    ::unlink(path.c_str());
+  }
+  ~TempLog() { ::unlink(path.c_str()); }
+};
+
+// A Record's key and value are views into a buffer that dies inside replay(),
+// so anything kept past the callback has to be copied. Doing that here rather
+// than in the library keeps the replay path allocation-free.
+struct Entry {
+  Record::Op op;
+  std::string key;
+  std::string value;
+};
+
+std::vector<Entry> drain(const std::string& path, ReplayResult* out = nullptr) {
+  std::vector<Entry> got;
+  const ReplayResult r = replay(path, [&](const Record& rec) {
+    got.push_back({rec.op, std::string(rec.key), std::string(rec.value)});
+  });
+  if (out) *out = r;
+  return got;
+}
+
+std::string read_file(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+}
+
+void write_file(const std::string& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+void append_raw(const std::string& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary | std::ios::app);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+}  // namespace
 
 TEST_CASE("crc32 matches the published values") {
   // The check value every CRC-32 implementation is expected to agree on. If
@@ -165,4 +223,190 @@ TEST_CASE("a length field is not believed on sight") {
     for (size_t i = 13; i < 21; ++i) damaged[i] = static_cast<char>(0xFF);
     CHECK(decode_record(damaged).status == DecodeStatus::Incomplete);
   }
+}
+
+// --------------------------------------------------------------------
+// The log as a file: append, fsync, replay.
+// --------------------------------------------------------------------
+
+TEST_CASE("a log that has never been written replays to nothing") {
+  ReplayResult r;
+  const auto got = drain("wal_test_definitely_absent.log", &r);
+  // A first run is not a failure and must not need special-casing at startup.
+  CHECK(got.empty());
+  CHECK(r.records == 0);
+  CHECK(r.good_bytes == 0);
+  CHECK_FALSE(r.truncated);
+}
+
+TEST_CASE("an empty log replays to nothing and is left alone") {
+  TempLog log("empty");
+  { Wal wal(log.path, SyncPolicy::kNo); }  // creating it is enough
+
+  ReplayResult r;
+  drain(log.path, &r);
+  CHECK(r.records == 0);
+  CHECK(r.good_bytes == 0);
+  CHECK_FALSE(r.truncated);
+}
+
+TEST_CASE("records survive a close and a reopen, in order") {
+  TempLog log("roundtrip");
+  {
+    Wal wal(log.path, SyncPolicy::kAlways);
+    REQUIRE(wal.append(Record::Op::kSet, "alpha", "one"));
+    REQUIRE(wal.append(Record::Op::kSet, "beta", "two"));
+    REQUIRE(wal.append(Record::Op::kDelete, "alpha", ""));
+  }
+
+  ReplayResult r;
+  const auto got = drain(log.path, &r);
+  CHECK(r.records == 3);
+  CHECK_FALSE(r.truncated);
+  REQUIRE(got.size() == 3);
+
+  CHECK(got[0].op == Record::Op::kSet);
+  CHECK(got[0].key == "alpha");
+  CHECK(got[0].value == "one");
+  CHECK(got[1].key == "beta");
+  // Order is the whole point: the delete has to arrive after the set, or
+  // replay rebuilds a state that never existed.
+  CHECK(got[2].op == Record::Op::kDelete);
+  CHECK(got[2].key == "alpha");
+  CHECK(got[2].value.empty());
+}
+
+TEST_CASE("every sync policy writes the same records") {
+  // The policy decides when bytes are forced to the platter, not what goes
+  // into the file. Nothing about the format may depend on it.
+  for (const SyncPolicy policy :
+       {SyncPolicy::kAlways, SyncPolicy::kEverySec, SyncPolicy::kNo}) {
+    TempLog log("policy");
+    {
+      Wal wal(log.path, policy);
+      REQUIRE(wal.append(Record::Op::kSet, "k", "v"));
+      REQUIRE(wal.maybe_sync());
+    }
+    const auto got = drain(log.path);
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].key == "k");
+    CHECK(got[0].value == "v");
+  }
+}
+
+TEST_CASE("size() tracks the file and survives reopening") {
+  TempLog log("size");
+  uint64_t after_two = 0;
+  {
+    Wal wal(log.path, SyncPolicy::kNo);
+    CHECK(wal.size() == 0);
+    REQUIRE(wal.append(Record::Op::kSet, "a", "1"));
+    REQUIRE(wal.append(Record::Op::kSet, "b", "2"));
+    after_two = wal.size();
+    CHECK(after_two == 2 * (kRecordHeaderSize + 2));
+  }
+  {
+    // Reopening must not restart the count, or M3 would flush the memtable on
+    // a threshold it had already passed.
+    Wal wal(log.path, SyncPolicy::kNo);
+    CHECK(wal.size() == after_two);
+  }
+}
+
+TEST_CASE("keys and values containing NUL and CRLF survive the file") {
+  TempLog log("binary");
+  const std::string key("k\0\r\n", 4);
+  const std::string value("v\0\xff\r\n", 5);
+  {
+    Wal wal(log.path, SyncPolicy::kAlways);
+    REQUIRE(wal.append(Record::Op::kSet, key, value));
+  }
+  const auto got = drain(log.path);
+  REQUIRE(got.size() == 1);
+  CHECK(got[0].key == key);
+  CHECK(got[0].value == value);
+}
+
+TEST_CASE("a torn tail is dropped and cut off the file") {
+  TempLog log("torn");
+  {
+    Wal wal(log.path, SyncPolicy::kAlways);
+    REQUIRE(wal.append(Record::Op::kSet, "a", "1"));
+    REQUIRE(wal.append(Record::Op::kSet, "b", "2"));
+  }
+  const size_t intact = read_file(log.path).size();
+
+  // What a kill -9 partway through a third append leaves behind.
+  std::string third;
+  encode_record(third, Record::Op::kSet, 123, "c", "3");
+  append_raw(log.path, third.substr(0, third.size() / 2));
+
+  ReplayResult r;
+  auto got = drain(log.path, &r);
+  CHECK(r.records == 2);
+  CHECK(got.size() == 2);
+  CHECK(r.truncated);
+  CHECK(r.good_bytes == intact);
+  // Cut, not merely ignored -- otherwise the next append would sit behind the
+  // wreckage and every later replay would stop at it.
+  CHECK(read_file(log.path).size() == intact);
+
+  ReplayResult again;
+  got = drain(log.path, &again);
+  CHECK(again.records == 2);
+  CHECK_FALSE(again.truncated);
+}
+
+TEST_CASE("a damaged record hides every record after it") {
+  TempLog log("corrupt");
+  {
+    Wal wal(log.path, SyncPolicy::kAlways);
+    REQUIRE(wal.append(Record::Op::kSet, "a", "1"));
+    REQUIRE(wal.append(Record::Op::kSet, "b", "2"));
+    REQUIRE(wal.append(Record::Op::kSet, "c", "3"));
+  }
+
+  const size_t record_len = kRecordHeaderSize + 2;  // 1-byte key, 1-byte value
+  std::string bytes = read_file(log.path);
+  REQUIRE(bytes.size() == 3 * record_len);
+  bytes[record_len + kRecordHeaderSize] ^= 0x01;  // the second record's key
+  write_file(log.path, bytes);
+
+  ReplayResult r;
+  const auto got = drain(log.path, &r);
+  // "c" was intact on disk and is still discarded. That is deliberate: the
+  // log is ordered, so a record whose predecessor cannot be read cannot be
+  // applied safely either -- replaying it could resurrect a deleted key.
+  REQUIRE(got.size() == 1);
+  CHECK(got[0].key == "a");
+  CHECK(r.records == 1);
+  CHECK(r.truncated);
+  CHECK(read_file(log.path).size() == record_len);
+}
+
+TEST_CASE("appending after recovery continues from the intact prefix") {
+  TempLog log("resume");
+  {
+    Wal wal(log.path, SyncPolicy::kAlways);
+    REQUIRE(wal.append(Record::Op::kSet, "a", "1"));
+  }
+  std::string partial;
+  encode_record(partial, Record::Op::kSet, 1, "b", "2");
+  append_raw(log.path, partial.substr(0, 7));
+
+  ReplayResult r;
+  drain(log.path, &r);
+  REQUIRE(r.truncated);
+
+  {
+    Wal wal(log.path, SyncPolicy::kAlways);
+    // Opened at the clean boundary the truncation left, not past the garbage.
+    CHECK(wal.size() == r.good_bytes);
+    REQUIRE(wal.append(Record::Op::kSet, "c", "3"));
+  }
+
+  const auto got = drain(log.path);
+  REQUIRE(got.size() == 2);
+  CHECK(got[0].key == "a");
+  CHECK(got[1].key == "c");
 }

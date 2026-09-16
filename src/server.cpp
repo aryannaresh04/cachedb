@@ -26,11 +26,6 @@ constexpr size_t kReadChunk = 16 * 1024;
 
 }  // namespace
 
-void Fd::reset(int fd) {
-  if (fd_ >= 0) ::close(fd_);
-  fd_ = fd;
-}
-
 Server::Server(Store& store, uint16_t port) : store_(store) {
   listener_.reset(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
   if (!listener_.valid()) throw_errno("socket");

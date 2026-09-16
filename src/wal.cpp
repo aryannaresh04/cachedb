@@ -1,6 +1,11 @@
 #include "wal.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <array>
+#include <cerrno>
+#include <system_error>
 
 namespace cachedb {
 namespace {
@@ -53,6 +58,39 @@ uint64_t load_u64(const char* p) {
   uint64_t v = 0;
   for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
   return v;
+}
+
+int64_t now_ms() {
+  // system_clock, not steady_clock: this timestamp outlives the process and
+  // becomes an absolute expiry point at M4, so it has to mean something to the
+  // next run. Interval measurement inside Wal uses steady_clock instead.
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+// write() is allowed to accept fewer bytes than offered, even for a regular
+// file -- a signal or a full disk will do it. Looping is not optional: a
+// single unchecked write() silently truncates a record. If we die partway
+// through, the short prefix left behind is exactly the torn record replay
+// expects to find.
+bool write_all(int fd, std::string_view data) {
+  const char* p = data.data();
+  size_t left = data.size();
+  while (left > 0) {
+    const ssize_t n = ::write(fd, p, left);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    p += n;
+    left -= static_cast<size_t>(n);
+  }
+  return true;
+}
+
+[[noreturn]] void throw_errno(const char* what, const std::string& path) {
+  throw std::system_error(errno, std::generic_category(), what + (" " + path));
 }
 
 }  // namespace
@@ -123,6 +161,103 @@ DecodeResult decode_record(std::string_view in) {
   result.record.timestamp_ms = static_cast<int64_t>(timestamp);
   result.record.key = in.substr(kRecordHeaderSize, klen);
   result.record.value = in.substr(kRecordHeaderSize + klen, vlen);
+  return result;
+}
+
+Wal::Wal(const std::string& path, SyncPolicy policy)
+    : policy_(policy), last_sync_(std::chrono::steady_clock::now()) {
+  // O_APPEND so every write lands at the true end of the file regardless of
+  // where the offset was left. It costs nothing here and removes a whole class
+  // of bug where a stale offset overwrites committed records.
+  fd_.reset(::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644));
+  if (!fd_.valid()) throw_errno("open", path);
+
+  const off_t end = ::lseek(fd_.get(), 0, SEEK_END);
+  if (end < 0) throw_errno("lseek", path);
+  size_ = static_cast<uint64_t>(end);
+}
+
+bool Wal::append(Record::Op op, std::string_view key, std::string_view value) {
+  buf_.clear();
+  encode_record(buf_, op, now_ms(), key, value);
+  if (!write_all(fd_.get(), buf_)) return false;
+  size_ += buf_.size();
+
+  if (policy_ == SyncPolicy::kAlways) return sync();
+  return true;
+}
+
+bool Wal::sync() {
+  for (;;) {
+    if (::fsync(fd_.get()) == 0) break;
+    // EINTR is a signal arriving, not an I/O failure, and retrying is correct.
+    if (errno == EINTR) continue;
+    // Anything else is not safely retryable. Linux reports a writeback error
+    // once and then clears it, so calling fsync again can return success while
+    // the data is still gone -- the failure would be laundered into an ack.
+    // There is nothing honest to do but refuse to acknowledge the write.
+    return false;
+  }
+  last_sync_ = std::chrono::steady_clock::now();
+  return true;
+}
+
+bool Wal::maybe_sync() {
+  if (policy_ != SyncPolicy::kEverySec) return true;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_sync_ < std::chrono::seconds(1)) return true;
+  return sync();
+}
+
+ReplayResult replay(const std::string& path,
+                    const std::function<void(const Record&)>& apply) {
+  ReplayResult result;
+
+  // O_RDWR because a damaged tail has to be cut, and reopening for write would
+  // race with anything else touching the file between the two opens.
+  Fd fd(::open(path.c_str(), O_RDWR));
+  if (!fd.valid()) {
+    if (errno == ENOENT) return result;  // first run, nothing to recover
+    throw_errno("open", path);
+  }
+
+  // Read the log whole. It is bounded by the memtable flush threshold -- 4 MB
+  // from M3, since a flush truncates it -- so this is megabytes, never the
+  // dataset. If that stops being true the loop below already works on a
+  // sliding window; only the buffering would change.
+  std::string data;
+  char chunk[64 * 1024];
+  for (;;) {
+    const ssize_t n = ::read(fd.get(), chunk, sizeof(chunk));
+    if (n == 0) break;
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      throw_errno("read", path);
+    }
+    data.append(chunk, static_cast<size_t>(n));
+  }
+
+  const std::string_view in(data);
+  size_t offset = 0;
+  for (;;) {
+    const DecodeResult r = decode_record(in.substr(offset));
+    if (r.status != DecodeStatus::Ok) break;
+    apply(r.record);
+    ++result.records;
+    offset += r.consumed;
+  }
+
+  result.good_bytes = offset;
+  result.truncated = offset < data.size();
+
+  if (result.truncated) {
+    // Cut the wreckage off now rather than leaving it to be re-examined. The
+    // next append then starts on a clean record boundary, and a second replay
+    // is a no-op instead of rediscovering the same damage.
+    if (::ftruncate(fd.get(), static_cast<off_t>(offset)) != 0) {
+      throw_errno("ftruncate", path);
+    }
+  }
   return result;
 }
 
