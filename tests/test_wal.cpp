@@ -5,7 +5,9 @@
 
 #include <unistd.h>
 
+#include <chrono>
 #include <fstream>
+#include <thread>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -409,4 +411,65 @@ TEST_CASE("appending after recovery continues from the intact prefix") {
   REQUIRE(got.size() == 2);
   CHECK(got[0].key == "a");
   CHECK(got[1].key == "c");
+}
+
+TEST_CASE("everysec does not sync a log nothing has been written to") {
+  using namespace std::chrono_literals;
+  TempLog log("idle");
+  // A 10 ms interval so the test does not spend a real second proving this.
+  Wal wal(log.path, SyncPolicy::kEverySec, 10ms);
+  CHECK(wal.syncs() == 0);
+
+  REQUIRE(wal.append(Record::Op::kSet, "k", "v"));
+  CHECK(wal.syncs() == 0);  // appending does not sync under this policy
+
+  std::this_thread::sleep_for(20ms);
+  REQUIRE(wal.maybe_sync());
+  CHECK(wal.syncs() == 1);  // the write is forced down
+
+  // The point of the fix. The timer keeps firing, and every one of these ticks
+  // used to cost an fsync on a file that had not changed -- for the whole life
+  // of an idle server.
+  for (int tick = 0; tick < 5; ++tick) {
+    std::this_thread::sleep_for(20ms);
+    REQUIRE(wal.maybe_sync());
+  }
+  CHECK(wal.syncs() == 1);
+
+  // A new write arms it again.
+  REQUIRE(wal.append(Record::Op::kSet, "k2", "v2"));
+  std::this_thread::sleep_for(20ms);
+  REQUIRE(wal.maybe_sync());
+  CHECK(wal.syncs() == 2);
+}
+
+TEST_CASE("the sync count matches what each policy promises") {
+  using namespace std::chrono_literals;
+  SUBCASE("always syncs once per append") {
+    TempLog log("count_always");
+    Wal wal(log.path, SyncPolicy::kAlways);
+    for (int i = 0; i < 5; ++i) {
+      REQUIRE(wal.append(Record::Op::kSet, "k", "v"));
+    }
+    CHECK(wal.syncs() == 5);
+  }
+  SUBCASE("no never syncs, however long it is left") {
+    TempLog log("count_no");
+    Wal wal(log.path, SyncPolicy::kNo, 1ms);
+    for (int i = 0; i < 5; ++i) {
+      REQUIRE(wal.append(Record::Op::kSet, "k", "v"));
+    }
+    std::this_thread::sleep_for(10ms);
+    REQUIRE(wal.maybe_sync());
+    CHECK(wal.syncs() == 0);
+  }
+  SUBCASE("an explicit sync is honoured even with nothing pending") {
+    // maybe_sync() skips a clean log; sync() is a direct instruction and does
+    // not second-guess the caller.
+    TempLog log("count_explicit");
+    Wal wal(log.path, SyncPolicy::kNo);
+    REQUIRE(wal.sync());
+    REQUIRE(wal.sync());
+    CHECK(wal.syncs() == 2);
+  }
 }

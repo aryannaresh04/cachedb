@@ -6,6 +6,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "fd.h"
 
@@ -115,21 +116,59 @@ namespace cachedb
     //
     // Call replay() on the path FIRST if this is recovery. Opening for append
     // does not inspect what is already there.
-    Wal(const std::string &path, SyncPolicy policy);
+    // The interval is a parameter so a test can drive kEverySec in
+    // milliseconds instead of sleeping a real second. Production passes
+    // nothing and gets the second the policy is named after.
+    Wal(const std::string &path, SyncPolicy policy,
+        std::chrono::milliseconds sync_interval = std::chrono::seconds(1));
 
     // Appends one mutation. Returns false if the bytes did not reach the
     // kernel -- or, under kAlways, the disk. A false here must stop the caller
     // acknowledging the write, which is the whole point of the log.
     bool append(Record::Op op, std::string_view key, std::string_view value);
 
+    // One mutation inside a batch.
+    struct Mutation
+    {
+      Record::Op op = Record::Op::kSet;
+      std::string_view key;
+      std::string_view value;
+    };
+
+    // Appends every mutation as a single write() and a single fsync.
+    //
+    // What this buys and what it does not. It makes a batch atomic against a
+    // *detected* failure: the log write either succeeds or it does not, and
+    // the caller learns which before touching anything in memory. It does not
+    // make it atomic against a crash -- a torn write still leaves a prefix of
+    // the batch on disk, and replay will apply the whole records in it.
+    //
+    // That asymmetry is acceptable rather than overlooked. A crash mid-write
+    // means the client never got a reply, so nothing was acknowledged and the
+    // invariant the crash test enforces still holds. Closing the second gap
+    // too would mean one record carrying every key, which is what real Redis
+    // does by logging the command rather than its per-key effects.
+    bool append_batch(const std::vector<Mutation> &mutations);
+
     // Driven from the event loop tick. Does nothing unless the policy is
-    // kEverySec and a second has actually elapsed, so it is cheap to call
-    // often.
+    // kEverySec, a second has actually elapsed, AND something has been written
+    // since the last sync -- so it is cheap to call often, and free on a
+    // server nobody is talking to.
     bool maybe_sync();
 
+    // Forces the log down unconditionally. Unlike maybe_sync() this does not
+    // check whether anything changed: an explicit request to sync is an
+    // explicit request, not a suggestion.
     bool sync();
 
     SyncPolicy policy() const { return policy_; }
+
+    // How many fsyncs have actually been issued. Exposed because the whole
+    // difference between the three policies is invisible from the outside
+    // otherwise -- it took strace to see it the first time -- and because a
+    // skipped-sync optimisation is exactly the kind of thing that silently
+    // stops working. INFO will want this at M4.
+    uint64_t syncs() const { return syncs_; }
 
     // Bytes in the log, as of the last append. Used from M3 to decide when the
     // memtable should be flushed and the log truncated.
@@ -145,7 +184,12 @@ namespace cachedb
     // for as long as the jump. The timestamp *inside* a record is the opposite
     // case and uses system_clock -- expiry is an absolute point in time.
     std::chrono::steady_clock::time_point last_sync_;
+    std::chrono::milliseconds sync_interval_;
     uint64_t size_ = 0;
+    // Bytes appended since the last fsync. Zero means the file on disk already
+    // matches what we have written, so a timer firing has nothing to do.
+    uint64_t bytes_since_sync_ = 0;
+    uint64_t syncs_ = 0;
   };
 
   struct ReplayResult

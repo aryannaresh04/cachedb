@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
     cachedb::Wal wal(wal_path, policy);
     store.set_wal(&wal);
 
+    cachedb::install_shutdown_handlers();
     cachedb::Server server(store, wal, port);
     std::fprintf(stderr, "cachedb listening on 127.0.0.1:%u, %zu keys, log %s\n",
                  port, store.size(), wal_path.c_str());

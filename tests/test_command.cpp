@@ -147,8 +147,11 @@ TEST_CASE("a mutation that cannot be logged replies with an error") {
   // Not ":0". A delete that was not logged has not happened, and reporting a
   // count would say it had.
   CHECK(run(s, {"DEL", "k"}) ==
-        "-ERR the delete could not be logged; this command was applied only "
-        "in part\r\n");
+        "-ERR the delete could not be logged and was not applied\r\n");
+  // The multi-key form takes the batched path and gives the same answer,
+  // which it can now do honestly: nothing was applied, not "some of it was".
+  CHECK(run(s, {"DEL", "k1", "k2", "k3"}) ==
+        "-ERR the delete could not be logged and was not applied\r\n");
   // Reads are unaffected: nothing was applied, so the key is simply absent.
   CHECK(run(s, {"GET", "k"}) == "$-1\r\n");
   CHECK(run(s, {"EXISTS", "k"}) == ":0\r\n");

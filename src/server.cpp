@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <system_error>
 #include <utility>
@@ -35,7 +36,28 @@ constexpr int kTickMs = 100;
   throw std::system_error(errno, std::generic_category(), what);
 }
 
+// Set from a signal handler, so it is volatile sig_atomic_t and nothing else.
+// Assigning to one of these is the only thing the standard promises is safe to
+// do from a handler -- no allocation, no locks, no I/O, no calling back into
+// the Server.
+volatile std::sig_atomic_t g_shutdown = 0;
+
+extern "C" void on_shutdown_signal(int) { g_shutdown = 1; }
+
 }  // namespace
+
+void install_shutdown_handlers() {
+  struct sigaction sa {};
+  sa.sa_handler = on_shutdown_signal;
+  ::sigemptyset(&sa.sa_mask);
+  // Deliberately not SA_RESTART. We want epoll_wait to come back with EINTR
+  // so the loop reaches its flag check promptly rather than sitting out the
+  // rest of its timeout.
+  sa.sa_flags = 0;
+  ::sigaction(SIGTERM, &sa, nullptr);
+  ::sigaction(SIGINT, &sa, nullptr);
+  // SIGPIPE needs no handler: every send() already passes MSG_NOSIGNAL.
+}
 
 Server::Server(Store& store, Wal& wal, uint16_t port)
     : store_(store), wal_(wal) {
@@ -77,11 +99,19 @@ Server::Server(Store& store, Wal& wal, uint16_t port)
 
 void Server::run() {
   std::vector<epoll_event> events(kMaxEvents);
-  for (;;) {
+  // Checking a flag once per iteration rather than waking the loop through a
+  // self-pipe. That is only safe because the wait has a finite timeout: the
+  // signal can land just after this check, and the worst case is noticing it
+  // one tick -- 100 ms -- later. With the infinite wait this loop used to have,
+  // a flag would have been the wrong answer and a self-pipe or signalfd the
+  // right one.
+  while (!g_shutdown) {
     const int n = ::epoll_wait(epoll_.get(), events.data(), kMaxEvents,
                                /*timeout=*/kTickMs);
     if (n < 0) {
-      // A signal arriving during the wait is routine, not a failure.
+      // A signal arriving during the wait is routine, not a failure -- and is
+      // in fact how a shutdown usually arrives, so go round and re-test the
+      // flag rather than treating it as an error.
       if (errno == EINTR) continue;
       throw_errno("epoll_wait");
     }
@@ -106,6 +136,20 @@ void Server::run() {
                    "lost\n");
     }
   }
+
+  // Stopping cleanly, so force the log down whatever the policy says. Under
+  // everysec or no there may be up to a second of writes sitting in the page
+  // cache: they would survive this process exiting, since the page cache is
+  // the kernel's, but not the machine losing power a moment later. A clean
+  // shutdown is the one chance to close that window for free.
+  std::fprintf(stderr, "cachedb: shutting down, syncing the log\n");
+  if (!wal_.sync()) {
+    std::fprintf(stderr, "cachedb: final WAL fsync failed\n");
+  }
+
+  // Returning rather than exiting matters: connections and their descriptors
+  // unwind through their destructors, and main returns normally, which is what
+  // lets ASan's leak check actually run.
 }
 
 void Server::accept_ready() {

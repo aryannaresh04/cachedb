@@ -7,6 +7,7 @@
 
 #include <string>
 
+using cachedb::DelBatchResult;
 using cachedb::DelResult;
 using cachedb::Record;
 using cachedb::replay;
@@ -207,4 +208,65 @@ TEST_CASE("a store with no log still applies every write") {
   Store s;
   CHECK(s.set("k", "v"));
   CHECK(s.del("k").durable);
+}
+
+TEST_CASE("a multi-key delete is all or nothing when the log refuses") {
+  // The gap this closes: DEL a b c used to delete whatever came before the
+  // failure and then report an error that could not say how far it got.
+  if (::access("/dev/full", W_OK) != 0) return;
+
+  TempLog log("batch");
+  Wal good(log.path, SyncPolicy::kNo);
+  Store s(&good);
+  REQUIRE(s.set("a", "1"));
+  REQUIRE(s.set("b", "2"));
+  REQUIRE(s.set("c", "3"));
+
+  // Swap in a log that fails every write, without disturbing what is already
+  // in memory.
+  Wal full("/dev/full", SyncPolicy::kNo);
+  s.set_wal(&full);
+
+  const DelBatchResult r = s.del_many({"a", "b", "c"});
+  CHECK_FALSE(r.durable);
+  CHECK(r.removed == 0);
+
+  // Not one of them went. Previously "a" would be gone and the client would
+  // have no way to learn that but to re-read every key it named.
+  CHECK(s.get("a").has_value());
+  CHECK(s.get("b").has_value());
+  CHECK(s.get("c").has_value());
+  CHECK(s.size() == 3);
+}
+
+TEST_CASE("a batched delete that succeeds counts and logs like the single one") {
+  TempLog log("batch_ok");
+  {
+    Wal wal(log.path, SyncPolicy::kAlways);
+    Store s(&wal);
+    REQUIRE(s.set("a", "1"));
+    REQUIRE(s.set("b", "2"));
+
+    const DelBatchResult r = s.del_many({"a", "b", "missing"});
+    CHECK(r.durable);
+    CHECK(r.removed == 2);  // "missing" was never live
+    CHECK(s.size() == 0);
+  }
+
+  // All three tombstones are in the log, including the one for a key that was
+  // never there -- from M3 that marker is what hides the key in an SSTable.
+  int tombstones = 0;
+  const ReplayResult rr = replay(log.path, [&](const Record& rec) {
+    if (rec.op == Record::Op::kDelete) ++tombstones;
+  });
+  CHECK(rr.records == 5);  // 2 sets + 3 deletes
+  CHECK(tombstones == 3);
+}
+
+TEST_CASE("deleting the same key twice in one command counts it once") {
+  Store s;
+  REQUIRE(s.set("k", "v"));
+  const DelBatchResult r = s.del_many({"k", "k"});
+  CHECK(r.durable);
+  CHECK(r.removed == 1);  // as real Redis counts it
 }

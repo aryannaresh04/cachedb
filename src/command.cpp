@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <string_view>
+#include <vector>
 
 namespace cachedb {
 namespace {
@@ -89,27 +90,32 @@ void cmd_get(const Command& c, Store& store, std::string& out) {
 }
 
 void cmd_del(const Command& c, Store& store, std::string& out) {
-  int64_t removed = 0;
-  for (size_t i = 1; i < c.args.size(); ++i) {
-    const DelResult r = store.del(c.args[i]);
+  constexpr const char* kFailed =
+      "ERR the delete could not be logged and was not applied";
+
+  // One key is the common case and needs no vector: it is a single record
+  // either way, so it takes the direct path and stays allocation-free.
+  if (c.args.size() == 2) {
+    const DelResult r = store.del(c.args[1]);
     if (!r.durable) {
-      // Multi-key DEL is not atomic across a log failure. Keys earlier in the
-      // argument list are already deleted and already logged; this one is not,
-      // and the remaining ones were never attempted. Replying with the count
-      // so far would read as "these succeeded and the rest did not exist",
-      // which is a different and false statement -- so the command reports an
-      // error and the client re-reads to find out where it stopped.
-      //
-      // Making it atomic needs the log to accept a batch that replays all or
-      // nothing, which is a real feature and not one M2 promises.
-      append_error(out,
-                   "ERR the delete could not be logged; this command was "
-                   "applied only in part");
+      append_error(out, kFailed);
       return;
     }
-    if (r.was_live) ++removed;
+    append_integer(out, r.was_live ? 1 : 0);
+    return;
   }
-  append_integer(out, removed);
+
+  // Several keys go down as one log write, so a failure leaves the command
+  // wholly unapplied rather than half done. Before this, a failure partway
+  // along deleted the keys before it and reported an error that could not say
+  // which -- and the client had no way to find out but to re-read every key.
+  const std::vector<std::string_view> keys(c.args.begin() + 1, c.args.end());
+  const DelBatchResult r = store.del_many(keys);
+  if (!r.durable) {
+    append_error(out, kFailed);
+    return;
+  }
+  append_integer(out, r.removed);
 }
 
 void cmd_exists(const Command& c, Store& store, std::string& out) {

@@ -13,6 +13,17 @@
 namespace cachedb
 {
 
+  // Installs SIGTERM and SIGINT handlers that ask the event loop to stop.
+  // Call once, from main, before run().
+  //
+  // Process-wide state, so it is a free function rather than something a
+  // Server constructor does behind your back.
+  //
+  // Without this the process could only ever be killed by signal, and a signal
+  // does not run the atexit hooks -- which is where ASan's leak check lives.
+  // Every leak in the connection lifecycle was invisible until this existed.
+  void install_shutdown_handlers();
+
   // The event loop: single threaded and level triggered, per PROJECT.md 3 and
   // 6.1. Level triggered because a missed readiness notification under edge
   // triggering is a hang that reproduces once a week, and correctness comes
@@ -27,7 +38,8 @@ namespace cachedb
     // loop can drive maybe_sync() -- writes reach it through the Store.
     Server(Store &store, Wal &wal, uint16_t port);
 
-    // Runs until the process is killed.
+    // Runs until SIGTERM or SIGINT arrives, then returns -- having forced the
+    // log down, so a clean stop costs nothing even under everysec or no.
     void run();
 
   private:

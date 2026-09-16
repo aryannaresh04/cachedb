@@ -37,6 +37,7 @@ add_library(cachedb_core
   src/bloom.cpp
   src/command.cpp
   src/connection.cpp
+  src/memtable.cpp
   src/resp.cpp
   src/store.cpp
   src/wal.cpp
