@@ -8,6 +8,7 @@ endfunction()
 
 cachedb_add_test(test_bloom)
 cachedb_add_test(test_command)
+cachedb_add_test(test_compaction)
 cachedb_add_test(test_connection)
 cachedb_add_test(test_memtable)
 cachedb_add_test(test_resp)

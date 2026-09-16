@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "bloom.h"
+#include "compaction.h"
 #include "memtable.h"
 #include "sstable.h"
 #include "wal.h"
@@ -116,6 +117,11 @@ namespace cachedb
     int bloom_bits_per_key = bloom::kDefaultBitsPerKey;
     // Benchmark-only. See the note on Sstable's constructor.
     bool use_bloom = true;
+    // Benchmark-only, for the same reason use_bloom is: PROJECT.md 10's
+    // read-amplification baseline was taken across 127 unmerged tables, and
+    // that figure stops being reproducible the moment tables get merged. The
+    // before half of the measurement needs a way to hold still.
+    bool use_compaction = true;
   };
 
   // The storage engine's front door: it owns durability, and the order the
@@ -211,6 +217,19 @@ namespace cachedb
     // reason -- its lazy deletes are real deletes.
     size_t sweep_expired(size_t budget);
 
+    // Merges a run of similarly sized tables into one, if there is one worth
+    // merging. Returns how many tables disappeared (0 when nothing ran).
+    // PROJECT.md 6.7.
+    //
+    // Blocking, between event loop iterations, like the flush. Section 3
+    // permits a thread; the engine is single-threaded everywhere else and
+    // that is a defended choice, not an accident. The cost is a stall
+    // proportional to the size of the merge, which is the measurement 6.7
+    // and question 10 ask for rather than a shortcoming to hide.
+    size_t maybe_compact();
+
+    uint64_t compactions() const { return compactions_; }
+
     // Removes everything: the memtable, every SSTable, and the log.
     //
     // The order is a durability question rather than a tidy-up. The tables go
@@ -277,6 +296,7 @@ namespace cachedb
     StoreOptions options_;
     uint64_t next_sequence_ = 1;
     uint64_t swept_keys_ = 0;
+    uint64_t compactions_ = 0;
     bool flush_failed_ = false;
     Wal *wal_ = nullptr;
   };

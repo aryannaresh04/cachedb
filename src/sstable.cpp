@@ -245,6 +245,67 @@ Sstable::Sstable(const std::string& path, bool use_bloom)
   }
 }
 
+namespace {
+// The cursor's read window. Big enough that a table is walked in a handful of
+// syscalls rather than one per entry, small enough that merging several
+// tables at once costs a few hundred kilobytes and not their whole size.
+constexpr size_t kCursorWindow = 64 * 1024;
+}  // namespace
+
+Sstable::Cursor::Cursor(const Sstable& table) : table_(&table) {
+  load();
+}
+
+bool Sstable::Cursor::ensure(size_t need) {
+  // Already in the window.
+  if (pos_ >= buf_start_ && pos_ - buf_start_ + need <= buf_.size()) {
+    return true;
+  }
+  // Never read past the data block: the index, the filter and the footer sit
+  // behind it and are not entries.
+  if (pos_ + need > table_->data_end_) return false;
+
+  const uint64_t remaining = table_->data_end_ - pos_;
+  const size_t want = static_cast<size_t>(
+      std::min<uint64_t>(remaining, std::max<size_t>(need, kCursorWindow)));
+  if (!read_exact(table_->fd_.get(), pos_, want, &buf_)) {
+    failed_ = true;
+    return false;
+  }
+  buf_start_ = pos_;
+  return true;
+}
+
+void Sstable::Cursor::load() {
+  valid_ = false;
+  if (failed_ || pos_ >= table_->data_end_) return;
+
+  // Header first, because the expiry flag decides how much follows it.
+  if (!ensure(9)) return;
+  const char* p = buf_.data() + (pos_ - buf_start_);
+  const uint32_t klen = load_u32(p);
+  const uint32_t vlen = load_u32(p + 4);
+  const auto flags = static_cast<unsigned char>(p[8]);
+  const bool has_expiry = (flags & kExpiryFlag) != 0;
+
+  const size_t body = 9 + (has_expiry ? 8 : 0);
+  const size_t total = body + klen + vlen;
+  // Re-checked against the window before any of it is read: an entry may
+  // straddle the end of the window, and ensure() will refill from this
+  // entry's own offset so that the whole of it is present.
+  if (!ensure(total)) return;
+  p = buf_.data() + (pos_ - buf_start_);  // ensure() may have moved the window
+
+  expires_at_ms_ = has_expiry ? static_cast<int64_t>(load_u64(p + 9)) : 0;
+  tombstone_ = (flags & kTombstoneFlag) != 0;
+  key_.assign(p + body, klen);
+  value_.assign(p + body + klen, vlen);
+  pos_ += total;
+  valid_ = true;
+}
+
+void Sstable::Cursor::next() { load(); }
+
 Sstable::Lookup Sstable::get(std::string_view key) const {
   // The filter first, because the whole point of it is to answer without
   // touching the disk at all. Skipping it is a benchmark-only setting: the

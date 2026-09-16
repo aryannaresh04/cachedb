@@ -139,6 +139,12 @@ void Server::run() {
     // memtable until a flush happened to sweep it out.
     store_.sweep_expired(kSweepBudget);
 
+    // Compaction runs here rather than straight after a flush, so the two
+    // stalls stay separable. The flush's cost is already measured (10); this
+    // one is the measurement 6.7 asks for, and folding them together would
+    // make neither attributable.
+    store_.maybe_compact();
+
     // Once per tick regardless of whether anything happened, including when
     // epoll_wait returned on the timeout with n == 0. Under always and no this
     // returns immediately; under everysec it is the entire policy.

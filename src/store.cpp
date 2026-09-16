@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -64,6 +65,29 @@ bool fsync_dir(const std::string& path) {
   return ok;
 }
 
+// A run of this many similarly sized tables is worth merging. Four is
+// PROJECT.md 6.7's figure and the usual size-tiered default: small enough
+// that reads never walk far, large enough that each byte is not rewritten on
+// every flush.
+constexpr size_t kCompactionTrigger = 4;
+
+// Two tables belong to the same tier if neither is more than this many times
+// the size of the other. A merged table comes out roughly four times its
+// inputs, so it falls out of their tier by itself -- which is the whole idea
+// of size tiering, and why no level has to be written down anywhere.
+constexpr uint64_t kTierRatio = 2;
+
+// Where a merge is assembled before it is given its real name. Deliberately
+// not NNNNNN.sst, so a crash mid-merge leaves a file the directory scan
+// ignores rather than a table it would try to read.
+constexpr const char* kCompactTemp = "compact.tmp";
+
+uint64_t file_size(const std::string& path) {
+  struct ::stat st {};
+  if (::stat(path.c_str(), &st) != 0) return 0;
+  return static_cast<uint64_t>(st.st_size);
+}
+
 }  // namespace
 
 Store::Store(StoreOptions options) : options_(std::move(options)) {
@@ -84,6 +108,11 @@ Store::Store(StoreOptions options) : options_(std::move(options)) {
   // Newest first. The sequence number is the only thing that establishes
   // recency -- mtime would not, since a compaction at M4 rewrites old data
   // into a new file.
+  // A merge that died before its rename leaves this behind. The scan above
+  // already ignores it -- it is not NNNNNN.sst -- but leaving it would let it
+  // accumulate one per crash.
+  ::unlink((options_.dir + "/" + kCompactTemp).c_str());
+
   std::sort(sequences.rbegin(), sequences.rend());
   for (const uint64_t seq : sequences) {
     sstables_.push_back(
@@ -262,6 +291,102 @@ size_t Store::sweep_expired(size_t budget) {
   const size_t swept = memtable_.sweep_expired(now_ms(), budget);
   swept_keys_ += swept;
   return swept;
+}
+
+size_t Store::maybe_compact() {
+  if (!options_.use_compaction) return 0;
+  if (options_.dir.empty() || sstables_.size() < kCompactionTrigger) return 0;
+
+  std::vector<uint64_t> sizes;
+  sizes.reserve(sstables_.size());
+  for (const auto& table : sstables_) sizes.push_back(file_size(table->path()));
+
+  // sstables_ is newest first, so this walks from the oldest table towards
+  // the newest, taking the first run long enough to bother with. Oldest first
+  // on purpose: that is the end where `drop_obsolete` can be true, which is
+  // the only place tombstones and expired entries actually go away.
+  //
+  // The run must be *contiguous* in this vector, and that is not tidiness.
+  // The merged table inherits the sequence number of the newest table in the
+  // run, so it keeps that table's place in the recency order. A gap would
+  // mean some untouched table sat between the inputs in age, and the merged
+  // result would jump over it -- serving a value that a newer table had
+  // already replaced.
+  size_t best_begin = 0, best_len = 0;
+  size_t i = sstables_.size();
+  while (i > 0) {
+    size_t end = i;          // one past the oldest member of this run
+    uint64_t smallest = sizes[i - 1];
+    while (i > 0) {
+      const uint64_t candidate = sizes[i - 1];
+      const uint64_t low = std::min(candidate, smallest);
+      const uint64_t high = std::max(candidate, smallest);
+      if (low == 0 || high > low * kTierRatio) break;
+      smallest = low;
+      --i;
+    }
+    if (end - i >= kCompactionTrigger) {
+      best_begin = i;
+      best_len = end - i;
+      break;
+    }
+    if (end == i) --i;  // a zero-length run would not terminate the walk
+  }
+  if (best_len < kCompactionTrigger) return 0;
+
+  // Nothing older survives this merge, so tombstones and expired entries may
+  // finally be discarded rather than carried forward for ever.
+  const bool drop_obsolete = best_begin + best_len == sstables_.size();
+
+  std::vector<const Sstable*> inputs;
+  std::vector<std::string> paths;
+  for (size_t n = best_begin; n < best_begin + best_len; ++n) {
+    inputs.push_back(sstables_[n].get());
+    paths.push_back(sstables_[n]->path());
+  }
+  // The newest input's name, which the result takes over.
+  const std::string target = paths.front();
+  const std::string temp = options_.dir + "/" + kCompactTemp;
+
+  const CompactionResult merged = compact(inputs, temp, options_.bloom_bits_per_key,
+                                          drop_obsolete, now_ms());
+  if (!merged.ok) {
+    ::unlink(temp.c_str());
+    return 0;
+  }
+
+  // rename() before any unlink, and that order is the whole crash story. A
+  // rename is atomic, so after this the merged table either is or is not in
+  // place under a name a restart will read. Losing power here leaves the
+  // merged table *and* its inputs: harmless, because the merged table holds
+  // the newest version of every key they held and sits at the newest one's
+  // place in the order, so it shadows them completely. Wasted space until the
+  // next merge, and not a wrong answer. Unlinking first would instead leave a
+  // gap with no table at all.
+  if (::rename(temp.c_str(), target.c_str()) != 0) {
+    ::unlink(temp.c_str());
+    return 0;
+  }
+  if (!fsync_dir(options_.dir)) return 0;
+
+  // Closed before the old files are unlinked, so the space actually comes
+  // back rather than being held by an open descriptor on a deleted inode.
+  sstables_.erase(sstables_.begin() + static_cast<long>(best_begin),
+                  sstables_.begin() + static_cast<long>(best_begin + best_len));
+  for (size_t n = 1; n < paths.size(); ++n) ::unlink(paths[n].c_str());
+  fsync_dir(options_.dir);
+
+  // A merge that dropped everything leaves nothing worth opening.
+  if (merged.written > 0) {
+    sstables_.insert(sstables_.begin() + static_cast<long>(best_begin),
+                     std::make_unique<Sstable>(target, options_.use_bloom));
+  } else {
+    ::unlink(target.c_str());
+    fsync_dir(options_.dir);
+  }
+
+  ++compactions_;
+  return best_len - (merged.written > 0 ? 1 : 0);
 }
 
 bool Store::flush_all() {

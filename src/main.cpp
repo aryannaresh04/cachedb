@@ -22,7 +22,7 @@ void usage(const char* argv0) {
   std::fprintf(
       stderr,
       "usage: %s [--port N] [--dir PATH] [--fsync always|everysec|no]\n"
-      "          [--memtable-limit BYTES] [--no-bloom]\n",
+      "          [--memtable-limit BYTES] [--no-bloom] [--no-compaction]\n",
       argv0);
 }
 
@@ -49,6 +49,7 @@ int main(int argc, char** argv) {
   cachedb::SyncPolicy policy = cachedb::SyncPolicy::kAlways;
   size_t memtable_limit = cachedb::StoreOptions{}.memtable_limit_bytes;
   bool use_bloom = true;
+  bool use_compaction = true;
 
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -83,6 +84,13 @@ int main(int argc, char** argv) {
       use_bloom = false;
       continue;
     }
+    // Benchmarks only (PROJECT.md 10): the read-amplification baseline is a
+    // measurement of many unmerged tables, and there is no way to reproduce
+    // it once the server starts merging them on its own.
+    if (std::strcmp(argv[i], "--no-compaction") == 0) {
+      use_compaction = false;
+      continue;
+    }
     if (std::strcmp(argv[i], "--fsync") == 0 && i + 1 < argc) {
       if (!parse_fsync(argv[++i], &policy)) {
         std::fprintf(stderr, "cachedb: unknown fsync policy: %s\n", argv[i]);
@@ -107,6 +115,7 @@ int main(int argc, char** argv) {
     store_options.dir = dir;
     store_options.memtable_limit_bytes = memtable_limit;
     store_options.use_bloom = use_bloom;
+    store_options.use_compaction = use_compaction;
     cachedb::Store store(store_options);
 
     // Recovery runs before the listener exists, so no client can read a state

@@ -314,3 +314,100 @@ TEST_CASE("an entry claiming an expiry it has no room for is not believed") {
   // crashes nor invents a key out of bytes past the end.
   CHECK_FALSE(t.get("k").found);
 }
+
+TEST_CASE("a cursor walks every entry in key order") {
+  TempFile f("cursor");
+  {
+    SstableWriter w(f.path);
+    w.add("a", "1", false);
+    w.add("b", "", true, 0);            // tombstone
+    w.add("c", "3", false, 1700000000000);  // expiring
+    w.add("d", "4", false);
+    REQUIRE(w.finish());
+  }
+  const Sstable t(f.path);
+
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  std::vector<bool> tombstones;
+  std::vector<int64_t> expiries;
+  for (auto c = t.cursor(); c.valid(); c.next()) {
+    keys.emplace_back(c.key());
+    values.emplace_back(c.value());
+    tombstones.push_back(c.tombstone());
+    expiries.push_back(c.expires_at_ms());
+  }
+
+  CHECK(keys == std::vector<std::string>{"a", "b", "c", "d"});
+  CHECK(values == std::vector<std::string>{"1", "", "3", "4"});
+  CHECK(tombstones == std::vector<bool>{false, true, false, false});
+  CHECK(expiries == std::vector<int64_t>{0, 0, 1700000000000, 0});
+
+  auto c = t.cursor();
+  while (c.valid()) c.next();
+  CHECK_FALSE(c.failed());  // a clean end, not an error
+}
+
+TEST_CASE("a cursor over an empty table is immediately done") {
+  TempFile f("cursor_empty");
+  {
+    SstableWriter w(f.path);
+    REQUIRE(w.finish());
+  }
+  auto c = Sstable(f.path).cursor();
+  CHECK_FALSE(c.valid());
+  CHECK_FALSE(c.failed());
+}
+
+TEST_CASE("a cursor handles entries larger than its read window") {
+  // The window is 64 KB. An entry bigger than that has to make the cursor
+  // refill from the entry's own offset rather than give up, or a single large
+  // value would end iteration early and a merge would silently lose every
+  // key after it.
+  TempFile f("cursor_big");
+  const std::string big(200 * 1024, 'v');
+  {
+    SstableWriter w(f.path);
+    w.add("aaa", big, false);
+    w.add("bbb", "small", false);
+    REQUIRE(w.finish());
+  }
+  const Sstable t(f.path);
+
+  auto c = t.cursor();
+  REQUIRE(c.valid());
+  CHECK(c.key() == "aaa");
+  CHECK(c.value().size() == big.size());
+  CHECK(c.value() == big);
+  c.next();
+  REQUIRE(c.valid());
+  CHECK(c.key() == "bbb");
+  CHECK(c.value() == "small");
+  c.next();
+  CHECK_FALSE(c.valid());
+  CHECK_FALSE(c.failed());
+}
+
+TEST_CASE("a cursor walks a table far larger than one window") {
+  TempFile f("cursor_many");
+  std::map<std::string, std::pair<std::string, bool>> rows;
+  for (int i = 0; i < 5000; ++i) {
+    char key[16];
+    std::snprintf(key, sizeof(key), "key%06d", i);
+    rows[key] = {std::string(100, 'v'), false};
+  }
+  write_table(f.path, rows);
+  const Sstable t(f.path);
+
+  size_t seen = 0;
+  std::string previous;
+  for (auto c = t.cursor(); c.valid(); c.next()) {
+    // Sorted and strictly increasing, which is what a merge relies on.
+    CHECK(previous < std::string(c.key()));
+    previous.assign(c.key());
+    CHECK(c.value().size() == 100);
+    ++seen;
+  }
+  CHECK(seen == rows.size());
+  CHECK(seen == t.entry_count());
+}

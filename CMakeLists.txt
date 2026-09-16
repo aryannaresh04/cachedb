@@ -36,6 +36,7 @@ target_include_directories(doctest SYSTEM INTERFACE
 add_library(cachedb_core
   src/bloom.cpp
   src/command.cpp
+  src/compaction.cpp
   src/connection.cpp
   src/memtable.cpp
   src/resp.cpp

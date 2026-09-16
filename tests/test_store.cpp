@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <filesystem>
+#include <fstream>
 
 #include <string>
 
@@ -733,4 +734,142 @@ TEST_CASE("the sweep counter INFO reports accumulates") {
   // A second sweep finds nothing left and the total does not move.
   CHECK(store.sweep_expired(100) == 0);
   CHECK(store.swept_keys() == 2);
+}
+
+TEST_CASE("compaction does not run before there is enough to merge") {
+  TempDir d;
+  Store store(opts(d));
+  for (int i = 0; i < 3; ++i) {
+    CHECK(store.set("k" + std::to_string(i), "v"));
+    CHECK(store.flush());
+  }
+  CHECK(store.sstable_count() == 3);
+  CHECK(store.maybe_compact() == 0);
+  CHECK(store.sstable_count() == 3);
+  CHECK(store.compactions() == 0);
+}
+
+TEST_CASE("compaction merges a run of tables and keeps every answer") {
+  TempDir d;
+  Store store(opts(d));
+  for (int i = 0; i < 4; ++i) {
+    CHECK(store.set("key" + std::to_string(i), "v" + std::to_string(i)));
+    CHECK(store.flush());
+  }
+  REQUIRE(store.sstable_count() == 4);
+  REQUIRE(count_tables(d.path) == 4);
+
+  CHECK(store.maybe_compact() == 3);  // four became one
+  CHECK(store.sstable_count() == 1);
+  CHECK(count_tables(d.path) == 1);   // the files really went
+  CHECK(store.compactions() == 1);
+
+  for (int i = 0; i < 4; ++i) {
+    const auto got = store.get("key" + std::to_string(i));
+    REQUIRE(got.has_value());
+    CHECK(got->get() == "v" + std::to_string(i));
+  }
+}
+
+TEST_CASE("a newer table outside the run still wins") {
+  // The ordering trap. The merged table takes the sequence number of the
+  // newest table in its run, so it keeps that table's place in the recency
+  // order. Had it taken the highest number instead, it would have sorted as
+  // newest while holding older data, and this key would come back as "old".
+  TempDir d;
+  Store store(opts(d));
+
+  CHECK(store.set("k", "old"));
+  CHECK(store.flush());
+  for (int i = 0; i < 3; ++i) {
+    CHECK(store.set("filler" + std::to_string(i), "v"));
+    CHECK(store.flush());
+  }
+  // A much larger table, so it lands in a different tier and is left alone.
+  for (int i = 0; i < 2000; ++i) {
+    CHECK(store.set("big" + std::to_string(i), std::string(100, 'x')));
+  }
+  CHECK(store.set("k", "new"));
+  CHECK(store.flush());
+  REQUIRE(store.sstable_count() == 5);
+
+  const size_t removed = store.maybe_compact();
+  CHECK(removed == 3);                 // the four small ones became one
+  CHECK(store.sstable_count() == 2);   // merged + the large one, untouched
+
+  const auto got = store.get("k");
+  REQUIRE(got.has_value());
+  CHECK(got->get() == "new");
+
+  // And again from disk, which is the half that actually tests the rule.
+  // In memory the merged table keeps whatever slot it was inserted into, so a
+  // wrong sequence number is invisible here; after a restart the order is
+  // rebuilt from the numbers alone and nothing else remembers. Giving the
+  // merged table the highest sequence passes every check above this line and
+  // fails the one below it.
+  StoreOptions o = opts(d);
+  Store rebuilt(o);
+  CHECK(rebuilt.sstable_count() == 2);
+  const auto after_restart = rebuilt.get("k");
+  REQUIRE(after_restart.has_value());
+  CHECK(after_restart->get() == "new");
+}
+
+TEST_CASE("compaction drops a tombstone only when nothing older is left") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("gone", "v"));
+  CHECK(store.flush());
+  CHECK(store.del("gone").durable);
+  CHECK(store.flush());
+  for (int i = 0; i < 2; ++i) {
+    CHECK(store.set("f" + std::to_string(i), "v"));
+    CHECK(store.flush());
+  }
+  REQUIRE(store.sstable_count() == 4);
+
+  // The run reaches the oldest table, so the tombstone and the value it hid
+  // both go. The key must still read as absent afterwards.
+  CHECK(store.maybe_compact() == 3);
+  CHECK_FALSE(store.get("gone").has_value());
+  CHECK_FALSE(store.exists("gone"));
+}
+
+TEST_CASE("a compacted store still reads correctly after a restart") {
+  TempDir d;
+  {
+    StoreOptions o = opts(d);
+    Store store(o);
+    for (int i = 0; i < 8; ++i) {
+      CHECK(store.set("key" + std::to_string(i), "v" + std::to_string(i)));
+      CHECK(store.flush());
+    }
+    CHECK(store.maybe_compact() > 0);
+  }
+
+  StoreOptions o = opts(d);
+  Store rebuilt(o);  // adopts whatever is on disk, by name
+  for (int i = 0; i < 8; ++i) {
+    const auto got = rebuilt.get("key" + std::to_string(i));
+    REQUIRE(got.has_value());
+    CHECK(got->get() == "v" + std::to_string(i));
+  }
+}
+
+TEST_CASE("a stale merge temp file is cleaned up and never read") {
+  TempDir d;
+  {
+    Store store(opts(d));
+    CHECK(store.set("k", "v"));
+    CHECK(store.flush());
+  }
+  // What a crash between writing a merge and renaming it would leave.
+  std::ofstream(d.path + "/compact.tmp", std::ios::binary)
+      << "not an sstable at all";
+
+  StoreOptions o = opts(d);
+  Store rebuilt(o);
+  CHECK(rebuilt.sstable_count() == 1);  // the temp file is not a table
+  REQUIRE(rebuilt.get("k").has_value());
+  CHECK_FALSE(std::filesystem::exists(d.path + "/compact.tmp"));
 }

@@ -169,6 +169,61 @@ namespace cachedb
 
     Lookup get(std::string_view key) const;
 
+    // Reads a table's entries in key order, one at a time and on demand.
+    //
+    // Pull-based, not a for_each callback, because a k-way merge has to ask
+    // several tables "what is your next key?" and advance only the one that
+    // wins. A callback owns its own loop and cannot be interleaved with
+    // another table's.
+    //
+    // Reads through a fixed window rather than loading the table. Merging
+    // four 4 MB tables would otherwise hold 16 MB at once, and the whole
+    // point of tiering is that the tables above L0 are larger still; bounded
+    // memory is what makes a merge something a live server can run.
+    //
+    // Borrows its table, which must outlive it.
+    class Cursor
+    {
+    public:
+      explicit Cursor(const Sstable &table);
+
+      // False once the data block is exhausted, and also once anything has
+      // gone wrong -- check failed() to tell those apart. A merge that
+      // treated an I/O error as a clean end would silently drop every key
+      // after it and write the result out as authoritative.
+      bool valid() const { return valid_; }
+      bool failed() const { return failed_; }
+
+      // Valid until the next call to next(), which may refill the window
+      // underneath them. A caller that keeps a key across an advance must
+      // copy it.
+      std::string_view key() const { return key_; }
+      std::string_view value() const { return value_; }
+      bool tombstone() const { return tombstone_; }
+      int64_t expires_at_ms() const { return expires_at_ms_; }
+
+      void next();
+
+    private:
+      bool ensure(size_t need); // window holds `need` bytes from pos_
+      void load();              // parse the entry at pos_
+
+      const Sstable *table_;
+      uint64_t pos_ = 0;       // file offset of the current entry
+      uint64_t buf_start_ = 0; // file offset the window begins at
+      std::string buf_;
+      // Copied out of the window rather than viewed into it, so an entry
+      // stays readable after a refill moves the window past it.
+      std::string key_;
+      std::string value_;
+      int64_t expires_at_ms_ = 0;
+      bool tombstone_ = false;
+      bool valid_ = false;
+      bool failed_ = false;
+    };
+
+    Cursor cursor() const { return Cursor(*this); }
+
     size_t entry_count() const { return entry_count_; }
     const std::string &path() const { return path_; }
 
