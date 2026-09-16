@@ -22,7 +22,8 @@ void usage(const char* argv0) {
   std::fprintf(
       stderr,
       "usage: %s [--port N] [--dir PATH] [--fsync always|everysec|no]\n"
-      "          [--memtable-limit BYTES] [--no-bloom] [--no-compaction]\n",
+      "          [--memtable-limit BYTES] [--no-bloom] [--no-compaction]\n"
+      "          [--no-group-commit]\n",
       argv0);
 }
 
@@ -50,6 +51,7 @@ int main(int argc, char** argv) {
   size_t memtable_limit = cachedb::StoreOptions{}.memtable_limit_bytes;
   bool use_bloom = true;
   bool use_compaction = true;
+  bool group_commit = true;
 
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -89,6 +91,13 @@ int main(int argc, char** argv) {
     // it once the server starts merging them on its own.
     if (std::strcmp(argv[i], "--no-compaction") == 0) {
       use_compaction = false;
+      continue;
+    }
+    // Benchmarks only (PROJECT.md 10): the before half of the group-commit
+    // measurement is one fsync per write, which cannot be reproduced once the
+    // server batches them.
+    if (std::strcmp(argv[i], "--no-group-commit") == 0) {
+      group_commit = false;
       continue;
     }
     if (std::strcmp(argv[i], "--fsync") == 0 && i + 1 < argc) {
@@ -143,6 +152,9 @@ int main(int argc, char** argv) {
     }
 
     cachedb::Wal wal(wal_path, policy);
+    // PROJECT.md 6.4. Only affects kAlways: everysec already batches by time,
+    // and no never syncs at all.
+    wal.set_group_commit(group_commit);
     store.set_wal(&wal);
 
     cachedb::install_shutdown_handlers();
@@ -152,7 +164,7 @@ int main(int argc, char** argv) {
         "cachedb listening on 127.0.0.1:%u, %zu keys in memory, %zu sstables, "
         "log %s\n",
         port, store.memtable_keys(), store.sstable_count(), wal_path.c_str());
-    server.run();
+    if (!server.run()) return 1;
   } catch (const std::exception& e) {
     // Startup failures are the exceptional case PROJECT.md 11 allows
     // exceptions for: there is nothing to degrade to if the port will not bind

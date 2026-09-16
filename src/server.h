@@ -40,7 +40,9 @@ namespace cachedb
 
     // Runs until SIGTERM or SIGINT arrives, then returns -- having forced the
     // log down, so a clean stop costs nothing even under everysec or no.
-    void run();
+    // False means a fatal durability failure: the log could not be fsynced
+    // while replies were being held for it. See run() in server.cpp.
+    [[nodiscard]] bool run();
 
   private:
     struct ConnState
@@ -53,7 +55,14 @@ namespace cachedb
     };
 
     void accept_ready();
-    void service(int fd, uint32_t events);
+    // Reads and executes, but does not write the reply out: under group commit
+    // no reply may leave before the iteration's fsync. Returns false if the
+    // connection was closed.
+    bool service(int fd, uint32_t events);
+
+    // The other half, run after that fsync: writes whatever the command left
+    // queued and re-arms the socket's interest.
+    void release(int fd);
     bool read_available(ConnState &state);
     bool write_pending(ConnState &state);
     void update_interest(int fd, ConnState &state);

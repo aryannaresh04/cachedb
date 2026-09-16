@@ -201,6 +201,24 @@ namespace cachedb
     // does by logging the command rather than its per-key effects.
     bool append_batch(const std::vector<Mutation> &mutations);
 
+    // Under kAlways, stop fsyncing inside append() and leave it to the caller
+    // to do once per event loop iteration. PROJECT.md 6.4.
+    //
+    // This does not weaken kAlways. The guarantee is that no acknowledged
+    // write is ever lost, and it survives because a reply is not allowed out
+    // until the fsync covering it has returned -- the server holds every
+    // reply, syncs once, and only then writes to any socket. What changes is
+    // the number of fsyncs, not what they promise.
+    //
+    // It does change what append() returning true means: not "durable" any
+    // more, but "in the kernel and covered by the next sync". The only caller
+    // permitted to treat that as an acknowledgement is one that syncs first.
+    void set_group_commit(bool on) { group_commit_ = on; }
+
+    // Whether anything has been written since the last fsync. The event loop
+    // uses this to skip the syscall entirely on a read-only iteration.
+    bool needs_sync() const { return bytes_since_sync_ > 0; }
+
     // Driven from the event loop tick. Does nothing unless the policy is
     // kEverySec, a second has actually elapsed, AND something has been written
     // since the last sync -- so it is cheap to call often, and free on a
@@ -249,6 +267,7 @@ namespace cachedb
     // matches what we have written, so a timer firing has nothing to do.
     uint64_t bytes_since_sync_ = 0;
     uint64_t syncs_ = 0;
+    bool group_commit_ = false;
   };
 
   struct ReplayResult

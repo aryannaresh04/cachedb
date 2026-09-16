@@ -224,7 +224,10 @@ bool Wal::append(Record::Op op, std::string_view key, std::string_view value,
   size_ += buf_.size();
   bytes_since_sync_ += buf_.size();
 
-  if (policy_ == SyncPolicy::kAlways) return sync();
+  // Under group commit the fsync is the event loop's job, once for everything
+  // that iteration produced. See set_group_commit in wal.h for why that keeps
+  // kAlways's promise rather than trading it away.
+  if (policy_ == SyncPolicy::kAlways && !group_commit_) return sync();
   return true;
 }
 
@@ -244,7 +247,7 @@ bool Wal::append_batch(const std::vector<Mutation>& mutations) {
   size_ += buf_.size();
   bytes_since_sync_ += buf_.size();
 
-  if (policy_ == SyncPolicy::kAlways) return sync();
+  if (policy_ == SyncPolicy::kAlways && !group_commit_) return sync();
   return true;
 }
 

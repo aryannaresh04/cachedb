@@ -107,8 +107,12 @@ Server::Server(Store& store, Wal& wal, uint16_t port)
   }
 }
 
-void Server::run() {
+bool Server::run() {
   std::vector<epoll_event> events(kMaxEvents);
+  // Sockets serviced this iteration, whose replies are held until the fsync.
+  // Reused across iterations so a busy loop costs no allocation.
+  std::vector<int> touched;
+  touched.reserve(kMaxEvents);
   // Checking a flag once per iteration rather than waking the loop through a
   // self-pipe. That is only safe because the wait has a finite timeout: the
   // signal can land just after this check, and the worst case is noticing it
@@ -125,13 +129,44 @@ void Server::run() {
       if (errno == EINTR) continue;
       throw_errno("epoll_wait");
     }
+    // Every ready socket is read and its commands executed before anything is
+    // written back. That is what makes one fsync cover the whole iteration.
+    touched.clear();
     for (int i = 0; i < n; ++i) {
       if (events[i].data.fd == listener_.get()) {
         accept_ready();
-      } else {
-        service(events[i].data.fd, events[i].events);
+      } else if (service(events[i].data.fd, events[i].events)) {
+        touched.push_back(events[i].data.fd);
       }
     }
+
+    // Group commit (PROJECT.md 6.4). One fsync for everything this iteration
+    // produced, and no reply leaves before it returns.
+    //
+    // This is the whole of the 20x gap against real Redis, which does exactly
+    // this: measured with strace, cachedb issued 1.00 fsyncs per write and
+    // Redis 0.02. Redis is not less durable -- it holds the replies too.
+    //
+    // A read-only iteration syncs nothing, because needs_sync() is false.
+    if (wal_.needs_sync() && !wal_.sync()) {
+      // Nothing has been acknowledged: every reply for this iteration is
+      // still sitting in a buffer, unsent. Exiting is what real Redis does
+      // when an AOF write fails under appendfsync=always, and for the same
+      // reason -- there is no honest reply to send and no honest way to
+      // continue. Every client sees a dropped connection and must treat its
+      // write as indeterminate, which is exactly what it is.
+      //
+      // Carrying on would be worse than it looks: Linux reports a writeback
+      // error once and then clears it, so the next fsync could return success
+      // over data that is already gone, laundering the failure into an ack.
+      std::fprintf(stderr,
+                   "cachedb: WAL fsync failed with %zu replies held; nothing "
+                   "was acknowledged. Exiting rather than answering.\n",
+                   touched.size());
+      return false;
+    }
+
+    for (const int fd : touched) release(fd);
 
     // Expired keys nobody has asked for, reclaimed a bounded slice at a time.
     // The lazy half of expiry handles anything a client reads; this handles
@@ -172,6 +207,7 @@ void Server::run() {
   // Returning rather than exiting matters: connections and their descriptors
   // unwind through their destructors, and main returns normally, which is what
   // lets ASan's leak check actually run.
+  return true;
 }
 
 void Server::accept_ready() {
@@ -214,22 +250,34 @@ void Server::accept_ready() {
   }
 }
 
-void Server::service(int fd, uint32_t events) {
+bool Server::service(int fd, uint32_t events) {
   const auto it = conns_.find(fd);
-  if (it == conns_.end()) return;
+  if (it == conns_.end()) return false;
   ConnState& state = it->second;
 
   // EPOLLHUP or EPOLLERR means the socket is finished; there is nobody left to
   // send a reply to.
   if (events & (EPOLLERR | EPOLLHUP)) {
     close_connection(fd);
-    return;
+    return false;
   }
 
   if ((events & EPOLLIN) && !read_available(state)) {
     close_connection(fd);
-    return;
+    return false;
   }
+
+  // Deliberately no write here. Whatever the commands queued stays queued
+  // until run() has fsynced the log, because a reply is an acknowledgement
+  // and an acknowledgement before the fsync is the one thing kAlways exists
+  // to prevent.
+  return true;
+}
+
+void Server::release(int fd) {
+  const auto it = conns_.find(fd);
+  if (it == conns_.end()) return;  // closed while this iteration ran
+  ConnState& state = it->second;
 
   if (state.conn.has_pending_output() && !write_pending(state)) {
     close_connection(fd);
