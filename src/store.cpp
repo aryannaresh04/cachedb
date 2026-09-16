@@ -82,6 +82,14 @@ constexpr uint64_t kTierRatio = 2;
 // ignores rather than a table it would try to read.
 constexpr const char* kCompactTemp = "compact.tmp";
 
+// The same for a flush, and for the same reason. A flush used to write
+// straight to NNNNNN.sst, which meant a kill -9 partway through left a
+// half-written file under a name the directory scan trusts -- and the strict
+// reader then refused to start at all, with every acknowledged write still
+// sitting safely in the log it had not yet truncated. crash_test.sh never saw
+// it because its 10,000 keys sit far below the 4 MB flush threshold.
+constexpr const char* kFlushTemp = "flush.tmp";
+
 uint64_t file_size(const std::string& path) {
   struct ::stat st {};
   if (::stat(path.c_str(), &st) != 0) return 0;
@@ -108,10 +116,11 @@ Store::Store(StoreOptions options) : options_(std::move(options)) {
   // Newest first. The sequence number is the only thing that establishes
   // recency -- mtime would not, since a compaction at M4 rewrites old data
   // into a new file.
-  // A merge that died before its rename leaves this behind. The scan above
-  // already ignores it -- it is not NNNNNN.sst -- but leaving it would let it
-  // accumulate one per crash.
+  // A merge or a flush that died before its rename leaves one of these
+  // behind. The scan above already ignores them -- neither is NNNNNN.sst --
+  // but leaving them would let them accumulate one per crash.
   ::unlink((options_.dir + "/" + kCompactTemp).c_str());
+  ::unlink((options_.dir + "/" + kFlushTemp).c_str());
 
   std::sort(sequences.rbegin(), sequences.rend());
   for (const uint64_t seq : sequences) {
@@ -430,9 +439,16 @@ bool Store::flush() {
 
   const uint64_t sequence = next_sequence_;
   const std::string path = table_path(sequence);
+  const std::string temp = options_.dir + "/" + kFlushTemp;
 
+  // Assembled under a name the directory scan ignores, and only given its
+  // real name once it is complete and fsynced. Anything called NNNNNN.sst is
+  // therefore a whole table by construction, which is what lets the reader
+  // stay strict: at startup it cannot tell a flush that was interrupted, safe
+  // to discard because the log still holds every record, from a finished
+  // table that was damaged later, which is not. The name answers that for it.
   {
-    SstableWriter writer(path, options_.bloom_bits_per_key);
+    SstableWriter writer(temp, options_.bloom_bits_per_key);
     // One pass in key order, which is what the memtable being sorted buys.
     // Tombstones go out too: a table that dropped them would lose the deletes
     // and the keys they hide would come back from an older table.
@@ -446,14 +462,24 @@ bool Store::flush() {
         [&writer](std::string_view key, const Memtable::Entry& entry) {
           writer.add(key, entry.value, entry.tombstone, entry.expires_at_ms);
         });
-    if (!writer.finish()) return false;
+    if (!writer.finish()) {
+      ::unlink(temp.c_str());
+      return false;
+    }
+  }
+
+  // Atomic, so the table appears under its real name all at once or not at
+  // all -- the same swap compaction relies on, see maybe_compact.
+  if (::rename(temp.c_str(), path.c_str()) != 0) {
+    ::unlink(temp.c_str());
+    return false;
   }
 
   // The table's bytes are fsynced, but the directory entry naming it is not
   // durable until the directory itself is synced -- see fsync_dir above. This
   // has to happen before the log is cut, or a power cut could take the name
   // away from a log that has already been emptied.
-  if (!options_.dir.empty() && !fsync_dir(options_.dir)) return false;
+  if (!fsync_dir(options_.dir)) return false;
 
   // The table is fsynced and reachable, so the data exists in two places.
   // Only now may the log be cut. Truncating first would leave a window where a crash loses
