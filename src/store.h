@@ -193,6 +193,24 @@ namespace cachedb
 
     bool exists(std::string_view key) const { return get(key).has_value(); }
 
+    // The active half of expiry (PROJECT.md 6.8): turns expired entries into
+    // tombstones so that keys nobody reads are still reclaimed. Driven from
+    // the event loop's tick; returns how many were swept.
+    //
+    // Writes nothing to the log, and that is a claim worth checking rather
+    // than a shortcut. The expiry that justifies each sweep is already
+    // durable -- it went down with the SET that set it. After a crash, replay
+    // puts the entry back carrying that same stamp, and the read path judges
+    // it expired again, so the visible state is identical either way. A log
+    // record here would be writing down a conclusion that can always be
+    // re-derived from what is already written.
+    //
+    // The one thing it is not neutral about is a clock that steps backwards:
+    // a swept entry is a tombstone for good, where an unswept one would have
+    // become visible again. Real Redis has the same property for the same
+    // reason -- its lazy deletes are real deletes.
+    size_t sweep_expired(size_t budget);
+
     // Writes the memtable out as a new SSTable and truncates the log. Normally
     // driven by the threshold; exposed so a test does not have to write four
     // megabytes to see one happen.

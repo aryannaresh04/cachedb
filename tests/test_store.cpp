@@ -572,3 +572,66 @@ TEST_CASE("a batched delete counts disk and expired keys the same way") {
   CHECK(r.durable);
   CHECK(r.removed == 2);  // the two that were visible
 }
+
+TEST_CASE("the sweep reclaims a key nobody read") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("gone", "v", cachedb::now_ms() - 1000));
+  CHECK(store.set("staying", "v"));
+  // Nothing has read "gone", so the lazy half of expiry has never seen it.
+  CHECK(store.memtable_keys() == 2);
+
+  CHECK(store.sweep_expired(100) == 1);
+  CHECK(store.memtable_keys() == 1);
+  CHECK_FALSE(store.get("gone").has_value());
+  CHECK(store.get("staying").has_value());
+}
+
+TEST_CASE("a swept key still hides a value in an older table") {
+  // The sweep marks instead of erasing, and this is why. If it erased, the
+  // read would fall through to the table below and answer v1 -- a value the
+  // client replaced, resurrected by its replacement expiring.
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("k", "v1"));
+  CHECK(store.flush());
+  CHECK(store.set("k", "v2", cachedb::now_ms() - 1000));
+
+  CHECK(store.sweep_expired(100) == 1);
+  CHECK_FALSE(store.get("k").has_value());
+}
+
+TEST_CASE("the sweep writes nothing to the log") {
+  // The claim that the sweep needs no log record. The expiry justifying it is
+  // already durable, so a crash replays the entry back with the same stamp
+  // and the read path judges it expired again -- the same visible state, for
+  // no bytes written.
+  TempLog log("sweep_no_log");
+  Wal wal(log.path, SyncPolicy::kNo);
+  Store store(&wal);
+  CHECK(store.set("a", "v", cachedb::now_ms() - 1000));
+  CHECK(store.set("b", "v", cachedb::now_ms() - 1000));
+
+  const uint64_t before = wal.size();
+  CHECK(store.sweep_expired(100) == 2);
+  CHECK(wal.size() == before);
+}
+
+TEST_CASE("a swept memtable survives a restart as the same absent keys") {
+  TempLog log("sweep_replay");
+  const int64_t past = cachedb::now_ms() - 1000;
+  {
+    Wal wal(log.path, SyncPolicy::kNo);
+    Store store(&wal);
+    CHECK(store.set("gone", "v", past));
+    CHECK(store.set("staying", "v"));
+    CHECK(store.sweep_expired(100) == 1);
+  }
+
+  Store rebuilt;
+  replay(log.path, [&](const Record& rec) { rebuilt.apply(rec); });
+  // The sweep left no record, so replay rebuilds the expired entry rather
+  // than a tombstone. Different in memory, identical to a client.
+  CHECK_FALSE(rebuilt.get("gone").has_value());
+  CHECK(rebuilt.get("staying").has_value());
+}

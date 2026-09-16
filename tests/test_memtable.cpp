@@ -263,3 +263,103 @@ TEST_CASE("writing over a tombstone can set an expiry") {
   CHECK(e->expires_at_ms == 4242);
   CHECK(m.live_count() == 1);
 }
+
+TEST_CASE("the sweep turns expired entries into tombstones") {
+  Memtable m;
+  m.set("expired", "v", 1000);
+  m.set("alive", "v", 9000);
+  m.set("forever", "v");
+
+  CHECK(m.sweep_expired(/*now=*/5000, /*budget=*/100) == 1);
+
+  const auto* e = m.find("expired");
+  REQUIRE(e != nullptr);
+  CHECK(e->tombstone);
+  CHECK(e->value.empty());
+  CHECK(e->expires_at_ms == 0);  // a tombstone has no lifetime
+
+  CHECK_FALSE(m.find("alive")->tombstone);
+  CHECK_FALSE(m.find("forever")->tombstone);
+  CHECK(m.live_count() == 2);
+}
+
+TEST_CASE("the sweep marks rather than erases") {
+  // The rule that keeps expiry from resurrecting data. The key may still sit
+  // in an older SSTable, and this row is the only thing that will hide it.
+  // Erasing would let the older copy come back -- a value returning from the
+  // dead because it expired.
+  Memtable m;
+  m.set("k", "v", 1000);
+  CHECK(m.sweep_expired(5000, 100) == 1);
+
+  CHECK(m.entry_count() == 1);       // the row is still there
+  CHECK(m.find("k") != nullptr);     // and still says something
+  CHECK(m.find("k")->tombstone);     // namely: absent, stop looking
+}
+
+TEST_CASE("the sweep examines no more than its budget") {
+  Memtable m;
+  for (int i = 0; i < 10; ++i) {
+    m.set("key" + std::to_string(i), "v", 1000);
+  }
+  // Three entries examined, so at most three swept, however many have run out.
+  CHECK(m.sweep_expired(5000, 3) == 3);
+  CHECK(m.live_count() == 7);
+}
+
+TEST_CASE("the sweep resumes where it stopped") {
+  Memtable m;
+  for (int i = 0; i < 6; ++i) {
+    m.set("key" + std::to_string(i), "v", 1000);
+  }
+  // One at a time. Without a cursor every call would re-examine key0 and the
+  // other five would never be reached.
+  size_t total = 0;
+  for (int i = 0; i < 6; ++i) total += m.sweep_expired(5000, 1);
+
+  CHECK(total == 6);
+  CHECK(m.live_count() == 0);
+}
+
+TEST_CASE("the sweep wraps round to the start") {
+  Memtable m;
+  m.set("a", "v");              // no expiry, never swept
+  m.set("b", "v");
+  // Walk past the end, which resets the cursor.
+  CHECK(m.sweep_expired(5000, 100) == 0);
+
+  // A key that expires after the cursor has already passed the end still gets
+  // swept on a later pass, rather than being stranded behind it.
+  m.set("a", "v", 1000);
+  CHECK(m.sweep_expired(5000, 100) == 1);
+  CHECK(m.find("a")->tombstone);
+}
+
+TEST_CASE("the sweep leaves tombstones and unexpired keys alone") {
+  Memtable m;
+  CHECK_FALSE(m.del("already_dead"));
+  m.set("forever", "v");
+  m.set("later", "v", 9000);
+
+  CHECK(m.sweep_expired(5000, 100) == 0);
+  CHECK(m.live_count() == 2);
+}
+
+TEST_CASE("sweeping an empty memtable does nothing and does not crash") {
+  Memtable m;
+  CHECK(m.sweep_expired(5000, 100) == 0);
+  m.set("k", "v", 1000);
+  CHECK(m.sweep_expired(5000, 100) == 1);
+}
+
+TEST_CASE("clearing resets the sweep cursor") {
+  Memtable m;
+  for (int i = 0; i < 4; ++i) m.set("key" + std::to_string(i), "v", 1000);
+  CHECK(m.sweep_expired(5000, 2) == 2);  // cursor now part way through
+  m.clear();
+
+  // If the cursor had survived the clear, this key -- sorting before where
+  // the cursor stopped -- would be skipped until the walk wrapped round.
+  m.set("aaa", "v", 1000);
+  CHECK(m.sweep_expired(5000, 1) == 1);
+}

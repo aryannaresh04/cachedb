@@ -32,6 +32,16 @@ constexpr size_t kReadChunk = 16 * 1024;
 // wakeups a second costs nothing measurable.
 constexpr int kTickMs = 100;
 
+// Entries the active expiry sweep examines per tick (PROJECT.md 6.8). At the
+// 10 Hz tick above that is 1,000 a second, so a memtable holding 15,000 keys
+// is walked end to end in about fifteen seconds.
+//
+// A count and not a time budget. The work per tick is then a constant rather
+// than something that varies with how many keys happen to have expired, which
+// is what makes its effect on tail latency a number that can be measured once
+// instead of a distribution that moves with the workload.
+constexpr size_t kSweepBudget = 100;
+
 [[noreturn]] void throw_errno(const char* what) {
   throw std::system_error(errno, std::generic_category(), what);
 }
@@ -122,6 +132,12 @@ void Server::run() {
         service(events[i].data.fd, events[i].events);
       }
     }
+
+    // Expired keys nobody has asked for, reclaimed a bounded slice at a time.
+    // The lazy half of expiry handles anything a client reads; this handles
+    // everything a client never reads, which would otherwise sit in the
+    // memtable until a flush happened to sweep it out.
+    store_.sweep_expired(kSweepBudget);
 
     // Once per tick regardless of whether anything happened, including when
     // epoll_wait returned on the timeout with n == 0. Under always and no this

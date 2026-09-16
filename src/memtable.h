@@ -65,6 +65,21 @@ namespace cachedb
     // Reports whether the key was live beforehand, which is DEL's reply count.
     bool del(std::string_view key);
 
+    // Turns expired entries into tombstones, examining at most `budget`
+    // entries and resuming next time where this one stopped. Returns how many
+    // were swept. PROJECT.md 6.8's active half.
+    //
+    // `now` is passed in rather than read here, which keeps this file free of
+    // clocks: Store does the judging, for this table and for the SSTables
+    // underneath it, so the two cannot disagree about the time.
+    //
+    // A cursor rather than random sampling. Redis samples because its hash
+    // table can pick a random slot in O(1); reaching a random element of a
+    // std::map means walking to it, so sampling here would cost a walk per
+    // sample and still visit some keys never. A cursor bounds the work per
+    // tick and guarantees every key is looked at eventually.
+    size_t sweep_expired(int64_t now, size_t budget);
+
     // Walks every entry in key order, tombstones included -- a flush has to
     // write those too, or the SSTable it produces would silently drop the
     // deletes and the keys would come back.
@@ -100,6 +115,10 @@ namespace cachedb
     // would construct a temporary std::string from the key: an allocation on
     // the hot path of every single GET.
     std::map<std::string, Entry, std::less<>> entries_;
+    // Where the next sweep resumes. A key and not an iterator: clear() would
+    // dangle an iterator, and a key simply stops matching anything, at which
+    // point lower_bound starts the walk again from wherever is nearest.
+    std::string sweep_cursor_;
     size_t live_count_ = 0;
     size_t bytes_ = 0;
   };

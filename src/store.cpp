@@ -219,6 +219,16 @@ void Store::apply(const Record& record) {
   // would write a table from a half-rebuilt memtable.
 }
 
+size_t Store::sweep_expired(size_t budget) {
+  // The clock is read here and nowhere below, so the sweep and a concurrent
+  // read cannot disagree about which entries have run out.
+  //
+  // No maybe_flush() afterwards: sweeping never grows the memtable, and the
+  // estimate does not fall when an entry is swept -- the allocator keeps the
+  // freed bytes, so the process still holds them.
+  return memtable_.sweep_expired(now_ms(), budget);
+}
+
 void Store::maybe_flush() {
   if (options_.dir.empty()) return;
   if (memtable_.bytes() < options_.memtable_limit_bytes) return;
