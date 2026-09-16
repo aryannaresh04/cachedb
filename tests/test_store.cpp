@@ -456,3 +456,119 @@ TEST_CASE("a store with no directory never flushes") {
   CHECK(s.sstable_count() == 0);
   CHECK(s.memtable_keys() == 200);
 }
+
+TEST_CASE("a key whose expiry has passed reads as absent") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("gone", "v", cachedb::now_ms() - 1000));
+  CHECK(store.set("staying", "v", cachedb::now_ms() + 3600'000));
+  CHECK(store.set("forever", "v"));
+
+  CHECK_FALSE(store.get("gone").has_value());
+  CHECK_FALSE(store.exists("gone"));
+  REQUIRE(store.get("staying").has_value());
+  CHECK(store.get("staying")->get() == "v");
+  REQUIRE(store.get("forever").has_value());
+  CHECK(store.get("forever")->get() == "v");
+}
+
+TEST_CASE("an expired entry hides an older value instead of uncovering it") {
+  // The reason an expired entry stops the search rather than being skipped.
+  // If the memtable's expired entry were treated as "nothing to say here",
+  // the read would fall through to the table below and serve v1 -- a value
+  // the client replaced. Same failure as a dropped tombstone, different door.
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("k", "v1"));
+  CHECK(store.flush());
+  CHECK(store.set("k", "v2", cachedb::now_ms() - 1000));
+
+  CHECK_FALSE(store.get("k").has_value());
+}
+
+TEST_CASE("an expiry survives a flush") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("gone", "v", cachedb::now_ms() - 1000));
+  CHECK(store.set("staying", "v", cachedb::now_ms() + 3600'000));
+  CHECK(store.flush());
+  // Both are now on disk and the memtable is empty, so these answers come
+  // from the SSTable's own stamps.
+  CHECK(store.memtable_keys() == 0);
+  CHECK_FALSE(store.get("gone").has_value());
+  REQUIRE(store.get("staying").has_value());
+  CHECK(store.get("staying")->get() == "v");
+}
+
+TEST_CASE("an expiry survives a restart") {
+  TempLog log("expiry_replay");
+  const int64_t past = cachedb::now_ms() - 1000;
+  const int64_t future = cachedb::now_ms() + 3600'000;
+  {
+    Wal wal(log.path, SyncPolicy::kNo);
+    Store store(&wal);
+    CHECK(store.set("gone", "v", past));
+    CHECK(store.set("staying", "v", future));
+  }
+
+  Store rebuilt;
+  const ReplayResult r =
+      replay(log.path, [&](const Record& rec) { rebuilt.apply(rec); });
+  CHECK(r.records == 2);
+  // Replayed as an absolute point in time, not a fresh lease. A key that ran
+  // out while the process was down has to come back already gone.
+  CHECK_FALSE(rebuilt.get("gone").has_value());
+  CHECK(rebuilt.get("staying").has_value());
+}
+
+TEST_CASE("a plain overwrite clears an expiry through the store") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("k", "v", cachedb::now_ms() - 1000));
+  CHECK_FALSE(store.get("k").has_value());
+  CHECK(store.set("k", "v2"));
+  REQUIRE(store.get("k").has_value());
+  CHECK(store.get("k")->get() == "v2");
+}
+
+TEST_CASE("DEL counts a key that lives only in an SSTable") {
+  // Was :0 before, which disagreed with EXISTS about the same key. The count
+  // is "was this visible a moment ago", and the memtable alone cannot answer
+  // that once a flush has moved the key out from under it.
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("k", "v"));
+  CHECK(store.flush());
+  REQUIRE(store.exists("k"));
+
+  const DelResult r = store.del("k");
+  CHECK(r.durable);
+  CHECK(r.was_live);
+  CHECK_FALSE(store.exists("k"));
+}
+
+TEST_CASE("DEL does not count a key that had already expired") {
+  // Was :1 before, reporting the removal of something no client could see.
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("k", "v", cachedb::now_ms() - 1000));
+  REQUIRE_FALSE(store.exists("k"));
+
+  const DelResult r = store.del("k");
+  CHECK(r.durable);
+  CHECK_FALSE(r.was_live);
+}
+
+TEST_CASE("a batched delete counts disk and expired keys the same way") {
+  TempDir d;
+  Store store(opts(d));
+  CHECK(store.set("on_disk", "v"));
+  CHECK(store.flush());
+  CHECK(store.set("in_memory", "v"));
+  CHECK(store.set("expired", "v", cachedb::now_ms() - 1000));
+
+  const DelBatchResult r =
+      store.del_many({"on_disk", "in_memory", "expired", "never_existed"});
+  CHECK(r.durable);
+  CHECK(r.removed == 2);  // the two that were visible
+}

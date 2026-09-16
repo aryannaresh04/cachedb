@@ -13,6 +13,20 @@
 namespace cachedb
 {
 
+  // Milliseconds since the Unix epoch, on the wall clock.
+  //
+  // system_clock and not steady_clock, and the difference is the whole reason
+  // this is the only clock the storage engine reads. A steady_clock's zero
+  // point is whenever the machine last booted, so a stamp taken from it means
+  // nothing after a restart and cannot be compared with a number a client
+  // sent us. The cost is stated plainly rather than hidden: if the system
+  // clock steps backwards, keys that had expired become visible again.
+  //
+  // Lives here because the log has always needed it to date a record, and a
+  // second clock function elsewhere is how two layers start disagreeing about
+  // what time it is.
+  int64_t now_ms();
+
   // CRC-32 as used by zlib, gzip and PNG (IEEE 802.3, reflected, polynomial
   // 0xEDB88320). Hand-rolled because the standard library has no checksum and
   // PROJECT.md 3 allows no other dependency.

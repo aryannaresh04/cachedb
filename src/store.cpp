@@ -67,11 +67,30 @@ std::string Store::table_path(uint64_t sequence) const {
 }
 
 std::optional<Value> Store::get(std::string_view key) const {
+  // The clock is read at most once per lookup, and not at all unless a stamp
+  // is actually met. Most keys have no expiry, and a GET that never sees one
+  // should not pay for a clock read on the hottest path in the program.
+  //
+  // Once, rather than per layer, for a second reason: two reads of the clock
+  // inside one lookup could straddle a millisecond and judge two layers
+  // against different values of "now".
+  int64_t now = 0;  // 0 means "not read yet", not "the epoch"
+  const auto expired = [&now](int64_t stamp) {
+    if (stamp == 0) return false;  // no expiry, so nothing to compare
+    if (now == 0) now = now_ms();
+    return stamp <= now;
+  };
+
   if (const Memtable::Entry* entry = memtable_.find(key)) {
     // Found in the newest layer, and that ends the search either way. A
     // tombstone means the key was deleted and no older file may be consulted
     // -- an older file is exactly where the deleted value still sits.
     if (entry->tombstone) return std::nullopt;
+    // An expired entry ends the search in exactly the same way, and for
+    // exactly the same reason. Falling through to an older table here would
+    // uncover the value this entry was hiding: SET k v1, flush, SET k v2 EX
+    // 10, wait -- and a GET would answer v1, a value the client replaced.
+    if (expired(entry->expires_at_ms)) return std::nullopt;
     return Value::borrowed(entry->value);
   }
 
@@ -82,29 +101,45 @@ std::optional<Value> Store::get(std::string_view key) const {
     Sstable::Lookup found = table->get(key);
     if (!found.found) continue;
     if (found.tombstone) return std::nullopt;
+    if (expired(found.expires_at_ms)) return std::nullopt;
     return Value::owned(std::move(found.value));
   }
   return std::nullopt;
 }
 
-bool Store::set(std::string_view key, std::string_view value) {
+bool Store::set(std::string_view key, std::string_view value,
+                int64_t expires_at_ms) {
   // The log entry goes down before the table changes, and that ordering is
   // the entire durability guarantee. Crash between the two and replay puts
   // the write back. Do it the other way round and a crash leaves a write that
   // was acknowledged and is gone -- the one outcome a database may not have.
-  if (wal_ && !wal_->append(Record::Op::kSet, key, value)) return false;
-  memtable_.set(key, value);
+  if (wal_ && !wal_->append(Record::Op::kSet, key, value, expires_at_ms)) {
+    return false;
+  }
+  memtable_.set(key, value, expires_at_ms);
   maybe_flush();
   return true;
 }
 
 DelResult Store::del(std::string_view key) {
+  // Asked before anything changes, because the answer is about the state the
+  // client last saw. Only a full layered read knows it: the memtable alone
+  // cannot see a key that lives solely in an SSTable, and cannot tell a live
+  // entry from one whose expiry has passed.
+  //
+  // This makes DEL cost what GET costs -- a filter check per table, and a
+  // block read from the first table that claims the key. That price buys one
+  // number, and it is worth knowing that RocksDB declines to pay it at all:
+  // its Delete returns nothing, because in a log-structured store "did that
+  // key exist" is not something you know, it is something you go and find out.
+  const bool was_live = get(key).has_value();
+
   // A tombstone is a log record like any other, for the same reason it is a
   // memtable entry like any other.
   if (wal_ && !wal_->append(Record::Op::kDelete, key, "")) return {};
-  const DelResult result{true, memtable_.del(key)};
+  memtable_.del(key);
   maybe_flush();
-  return result;
+  return {true, was_live};
 }
 
 DelBatchResult Store::del_many(const std::vector<std::string_view>& keys) {
@@ -122,7 +157,12 @@ DelBatchResult Store::del_many(const std::vector<std::string_view>& keys) {
   DelBatchResult result;
   result.durable = true;
   for (const std::string_view key : keys) {
-    if (memtable_.del(key)) ++result.removed;
+    // Same question as the single-key path, and the same reason it cannot be
+    // answered from the memtable. Counted before the tombstone goes in, so a
+    // key named twice in one command is counted once -- the second look
+    // already finds the tombstone the first one left.
+    if (get(key).has_value()) ++result.removed;
+    memtable_.del(key);
   }
   maybe_flush();
   return result;
@@ -131,7 +171,10 @@ DelBatchResult Store::del_many(const std::vector<std::string_view>& keys) {
 void Store::apply(const Record& record) {
   switch (record.op) {
     case Record::Op::kSet:
-      memtable_.set(record.key, record.value);
+      // The stamp is replayed as it was written, never recomputed. An expiry
+      // is a point in time, so a key that ran out while the process was down
+      // must come back already expired rather than getting a fresh lease.
+      memtable_.set(record.key, record.value, record.expires_at_ms);
       break;
     case Record::Op::kDelete:
       // The return is DEL's reply count, which recovery has nobody to tell.
@@ -160,9 +203,15 @@ bool Store::flush() {
     // One pass in key order, which is what the memtable being sorted buys.
     // Tombstones go out too: a table that dropped them would lose the deletes
     // and the keys they hide would come back from an older table.
+    // Entries that have already expired are written out too, stamp and all.
+    // Dropping them here would be the tombstone mistake wearing a different
+    // hat: the expired entry may be the only thing hiding a live copy in an
+    // older table, and leaving it out would let that copy resurface. Only a
+    // compaction of the oldest level can discard them, which is the same rule
+    // tombstones follow (PROJECT.md 6.7).
     memtable_.for_each(
         [&writer](std::string_view key, const Memtable::Entry& entry) {
-          writer.add(key, entry.value, entry.tombstone);
+          writer.add(key, entry.value, entry.tombstone, entry.expires_at_ms);
         });
     if (!writer.finish()) return false;
   }

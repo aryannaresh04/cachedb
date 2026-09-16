@@ -66,14 +66,6 @@ uint64_t load_u64(const char* p) {
 // that means the same thing as kSet.
 constexpr uint8_t kSetExOpByte = 2;
 
-int64_t now_ms() {
-  // system_clock, not steady_clock: this timestamp outlives the process and
-  // becomes an absolute expiry point at M4, so it has to mean something to the
-  // next run. Interval measurement inside Wal uses steady_clock instead.
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
 
 // write() is allowed to accept fewer bytes than offered, even for a regular
 // file -- a signal or a full disk will do it. Looping is not optional: a
@@ -100,6 +92,16 @@ bool write_all(int fd, std::string_view data) {
 }
 
 }  // namespace
+
+int64_t now_ms() {
+  // system_clock, not steady_clock: this stamp outlives the process and is
+  // compared against absolute expiry points, so it has to mean something to
+  // the next run. Interval measurement inside Wal uses steady_clock instead,
+  // which is the opposite trade and the right one there.
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
 
 uint32_t crc32(std::string_view data) {
   const auto& table = crc_table();

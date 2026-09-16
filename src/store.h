@@ -109,11 +109,24 @@ namespace cachedb
     // lose every key that only lives in it.
     explicit Store(StoreOptions options);
 
-    // nullopt means absent as far as a client is concerned, covering both
-    // "nowhere to be found" and "deleted".
+    // nullopt means absent as far as a client is concerned, covering
+    // "nowhere to be found", "deleted", and "expired".
+    //
+    // This is the only place in the engine that reads a clock. The memtable
+    // and the SSTables store expiry stamps and never interpret them, so the
+    // layers cannot disagree about what time it is -- which is how a key
+    // expires in one layer while the layer it was hiding keeps serving.
     std::optional<Value> get(std::string_view key) const;
 
-    [[nodiscard]] bool set(std::string_view key, std::string_view value);
+    // expires_at_ms is an absolute wall-clock stamp, not a duration; 0 means
+    // never. Converting a client's "EX 10" into a point in time happens at
+    // the command layer, so nothing below here has to know that relative
+    // expiries exist.
+    [[nodiscard]] bool set(std::string_view key, std::string_view value,
+                           int64_t expires_at_ms = 0);
+    // Costs what a get() costs. The count DEL replies with is "was this key
+    // visible a moment ago", and in a layered store that is a question with
+    // no cheap answer -- see del() in store.cpp.
     [[nodiscard]] DelResult del(std::string_view key);
     [[nodiscard]] DelBatchResult del_many(
         const std::vector<std::string_view> &keys);
@@ -132,7 +145,8 @@ namespace cachedb
     // megabytes to see one happen.
     [[nodiscard]] bool flush();
 
-    // Live keys in the memtable only. Keys that live solely in an SSTable are
+    // Live keys in the memtable only, and counting any that have expired but
+    // not yet been swept. Keys that live solely in an SSTable are
     // not counted: a true total would mean merging every level, which is what
     // a compaction does and not what a status line should.
     size_t memtable_keys() const { return memtable_.live_count(); }
